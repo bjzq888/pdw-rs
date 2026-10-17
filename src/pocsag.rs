@@ -13,6 +13,7 @@
 
 use crate::bch::BchDecoder;
 use crate::dsp::{AtbSlicer, RxQualityTracker};
+use serde::{Deserialize, Serialize};
 
 pub const POCSAG_SYNC: u32 = 0x7CD2_15D8;
 pub const POCSAG_IDLE: u32 = 0x7A89_C197;
@@ -28,7 +29,7 @@ pub enum PocsagMsgType {
     Both,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecodedPagerMessage {
     pub capcode: String,
     pub time: String,

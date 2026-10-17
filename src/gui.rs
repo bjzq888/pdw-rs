@@ -4,6 +4,7 @@
 //! - Event-driven GUI repainting: wakes immediately when a message is decoded, and otherwise
 //!   repaints only once per second (1 FPS) when the live oscilloscope is toggled off.
 //! - Toggleable `Scope` checkbox directly on the top toolbar (off by default to save CPU).
+//! - Built-in live HTTP/SSE Web Server (`web.rs`, default port `8008`) with runtime toggle and port configuration.
 //! - Idle-gated POCSAG bit clock: skips POCSAG symbol clock division when `pocbit == 0`.
 //! - Throttled telemetry mutex updates (~10 Hz instead of 100 Hz).
 
@@ -16,16 +17,19 @@ use crate::config::{
     is_human_readable_message, AppConfig, DuplicateBlocker, FilterAction, FilterRule, FilterType, FilterVerdict,
     InputSource, StatsTracker,
 };
-use crate::sdrconnect::{
-    start_sdrconnect_iq_capture, synthesize_sdrconnect_iq_frame_from_baseband, IqFmDemodulator,
-    SdrConnectControlCmd, SdrConnectParams, SdrConnectStream,
-};
 use crate::dsp::{
     AdaptiveEnvelopeTracker, AtbSlicer, AudioPreset, RxQualityTracker, COURSE_CLKT_HI,
     COURSE_CLKT_LO, INDEX1200, INDEX1600, INDEX2400, INDEX512, SUPPORTED_SAMPLE_RATES,
 };
 use crate::flex::FlexDecoder;
 use crate::pocsag::{DecodedPagerMessage, PocsagChannelDecoder};
+use crate::sdrconnect::{
+    start_sdrconnect_iq_capture, synthesize_sdrconnect_iq_frame_from_baseband, IqFmDemodulator,
+    SdrConnectControlCmd, SdrConnectParams, SdrConnectStream,
+};
+use crate::web::{
+    WebServerHandle, WebServerSharedState, WebTelemetrySnapshot, WebUiCommand, DEFAULT_WEB_PORT,
+};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use egui_extras::{Column, TableBuilder};
@@ -112,6 +116,11 @@ pub struct PdwApp {
     msg_rx: Receiver<DecodedPagerMessage>,
     telemetry: Arc<Mutex<DspTelemetry>>,
 
+    // Live Web Server state & handle
+    web_state: Arc<WebServerSharedState>,
+    web_cmd_rx: Receiver<WebUiCommand>,
+    web_server: Option<WebServerHandle>,
+
     // UI message buffers, sorting, search & inspector state
     paused: bool,
     monitor_messages: VecDeque<DecodedPagerMessage>,
@@ -157,6 +166,7 @@ impl PdwApp {
         let (cmd_tx, cmd_rx) = bounded::<WorkerCommand>(32);
         let (msg_tx, msg_rx) = bounded::<DecodedPagerMessage>(1024);
         let telemetry = Arc::new(Mutex::new(DspTelemetry::default()));
+        let (web_state, web_cmd_rx) = WebServerSharedState::new(Some(cc.egui_ctx.clone()));
 
         // Spawn dedicated real-time DSP & protocol decoder thread
         let telemetry_clone = Arc::clone(&telemetry);
@@ -188,6 +198,9 @@ impl PdwApp {
             cmd_tx,
             msg_rx,
             telemetry,
+            web_state,
+            web_cmd_rx,
+            web_server: None,
             paused: false,
             monitor_messages: VecDeque::with_capacity(1000),
             filtered_messages: VecDeque::with_capacity(500),
@@ -207,7 +220,102 @@ impl PdwApp {
             status_toast: String::new(),
         };
         app.restart_audio();
+        app.sync_web_server();
         app
+    }
+
+    fn sync_web_server(&mut self) {
+        if self.config.web_server_port == 0 {
+            self.config.web_server_port = DEFAULT_WEB_PORT;
+        }
+        if self.config.web_server_bind_addr.trim().is_empty() {
+            self.config.web_server_bind_addr = crate::web::DEFAULT_WEB_BIND_ADDR.to_string();
+        }
+
+        if self.config.web_server_enabled {
+            let already_matching = self
+                .web_server
+                .as_ref()
+                .map(|srv| {
+                    srv.port == self.config.web_server_port
+                        && srv.bind_addr == self.config.web_server_bind_addr
+                })
+                .unwrap_or(false);
+            if !already_matching {
+                if let Some(mut old_srv) = self.web_server.take() {
+                    old_srv.stop();
+                }
+                self.web_server = Some(WebServerHandle::start(
+                    &self.config.web_server_bind_addr,
+                    self.config.web_server_port,
+                    Arc::clone(&self.web_state),
+                ));
+            }
+        } else if let Some(mut old_srv) = self.web_server.take() {
+            old_srv.stop();
+        }
+    }
+
+    fn inject_test_pocsag(&self) {
+        let raw_burst = synthesize_pocsag_burst(
+            self.config.sample_rate,
+            1200,
+            1_234_567,
+            4,
+            "PDW-RS 48KHZ POCSAG-1200 TEST MESSAGE OK",
+            0.02,
+        );
+        let burst = if self.config.input_source == InputSource::SdrConnectIq {
+            let iq_frame = synthesize_sdrconnect_iq_frame_from_baseband(
+                &raw_burst,
+                self.config.sample_rate,
+                0.0,
+            );
+            let mut test_demod = IqFmDemodulator::new(
+                self.config.sample_rate,
+                self.config.sample_rate,
+                self.config.sdrconnect_iq_gain,
+                false,
+                -90.0,
+                self.config.sdrconnect_afc_enabled,
+                self.config.sdrconnect_channel_bw_hz,
+            );
+            test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst)
+        } else {
+            raw_burst
+        };
+        let _ = self.cmd_tx.send(WorkerCommand::InjectSamples(burst));
+    }
+
+    fn inject_test_flex(&self) {
+        let raw_burst = synthesize_flex_4fsk_burst(
+            self.config.sample_rate,
+            1_122_334,
+            "FLEX PHASE-A 4-FSK DECODE OK",
+            1_556_677,
+            "FLEX PHASE-B 4-FSK UNLOCKED!",
+            0.02,
+        );
+        let burst = if self.config.input_source == InputSource::SdrConnectIq {
+            let iq_frame = synthesize_sdrconnect_iq_frame_from_baseband(
+                &raw_burst,
+                self.config.sample_rate,
+                0.0,
+            );
+            let mut test_demod = IqFmDemodulator::new(
+                self.config.sample_rate,
+                self.config.sample_rate,
+                self.config.sdrconnect_iq_gain,
+                false,
+                -90.0,
+                self.config.sdrconnect_afc_enabled,
+                self.config.sdrconnect_channel_bw_hz,
+            );
+            test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst)
+        } else {
+            raw_burst
+        };
+        let _ = self.cmd_tx.send(WorkerCommand::InjectSamples(burst));
     }
 
     fn restart_audio(&mut self) {
@@ -275,6 +383,20 @@ impl PdwApp {
     }
 
     fn poll_decoded_messages(&mut self) {
+        while let Ok(web_cmd) = self.web_cmd_rx.try_recv() {
+            match web_cmd {
+                WebUiCommand::TriggerTestPocsag => self.inject_test_pocsag(),
+                WebUiCommand::TriggerTestFlex => self.inject_test_flex(),
+                WebUiCommand::TogglePause => self.paused = !self.paused,
+                WebUiCommand::ClearMessages => {
+                    self.monitor_messages.clear();
+                    self.filtered_messages.clear();
+                    self.selected_message = None;
+                    self.web_state.clear_messages();
+                }
+            }
+        }
+
         while let Ok(mut msg) = self.msg_rx.try_recv() {
             if self.paused {
                 continue;
@@ -306,21 +428,25 @@ impl PdwApp {
                 FilterVerdict::Unmatched => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, false, None);
+                    self.web_state.record_message(&msg, true, false);
                     self.push_monitor(msg);
                 }
                 FilterVerdict::MatchedMonitorOnly(idx) => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, false, Some(idx));
+                    self.web_state.record_message(&msg, true, false);
                     self.push_monitor(msg);
                 }
                 FilterVerdict::MatchedFilterOnly(idx) => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, true, Some(idx));
+                    self.web_state.record_message(&msg, false, true);
                     self.push_filtered(msg);
                 }
                 FilterVerdict::MatchedBoth(idx) => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, true, Some(idx));
+                    self.web_state.record_message(&msg, true, true);
                     self.push_filtered(msg.clone());
                     self.push_monitor(msg);
                 }
@@ -363,6 +489,41 @@ impl eframe::App for PdwApp {
             .map(|t| t.clone())
             .unwrap_or_default();
 
+        // Publish current telemetry & statistics snapshot to the live web server state
+        {
+            let (sdr_conn, vfo_hz, iq_rssi, afc_hz) = self
+                .sdrconnect_stream
+                .as_ref()
+                .and_then(|s| s.status.try_lock().ok())
+                .map(|st| {
+                    (
+                        st.connected,
+                        st.vfo_freq_hz,
+                        Some(st.iq_rssi_dbfs),
+                        Some(st.afc_offset_hz),
+                    )
+                })
+                .unwrap_or((false, None, None, None));
+
+            let web_telem = WebTelemetrySnapshot {
+                rx_quality_pct: telem.rx_quality_pct,
+                total_codewords: telem.total_codewords,
+                soft_recoveries: telem.soft_recoveries,
+                active_mode: telem.active_mode.clone(),
+                dc_center: telem.dc_center,
+                deviation: telem.deviation,
+                invert_active: telem.invert_active,
+                input_source: self.config.input_source.label().to_string(),
+                audio_status: self.audio_status.clone(),
+                sdr_connected: sdr_conn,
+                vfo_freq_hz: vfo_hz,
+                iq_rssi_dbfs: iq_rssi,
+                afc_offset_hz: afc_hz,
+                paused: self.paused,
+            };
+            self.web_state.update_telemetry(web_telem, &self.stats);
+        }
+
         // Top Toolbar & Optional Live 4-FSK Scope
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -395,6 +556,7 @@ impl eframe::App for PdwApp {
                     self.monitor_messages.clear();
                     self.filtered_messages.clear();
                     self.selected_message = None;
+                    self.web_state.clear_messages();
                 }
 
                 ui.separator();
@@ -416,70 +578,16 @@ impl eframe::App for PdwApp {
 
                 ui.separator();
                 if ui.button("Test POCSAG-1200").clicked() {
-                    let raw_burst = synthesize_pocsag_burst(
-                        self.config.sample_rate,
-                        1200,
-                        1_234_567,
-                        4,
-                        "PDW-RS 48KHZ POCSAG-1200 TEST MESSAGE OK",
-                        0.02,
-                    );
-                    let burst = if self.config.input_source == InputSource::SdrConnectIq {
-                        let iq_frame = synthesize_sdrconnect_iq_frame_from_baseband(
-                            &raw_burst,
-                            self.config.sample_rate,
-                            0.0,
-                        );
-                        let mut test_demod = IqFmDemodulator::new(
-                            self.config.sample_rate,
-                            self.config.sample_rate,
-                            self.config.sdrconnect_iq_gain,
-                            false,
-                            -90.0,
-                            self.config.sdrconnect_afc_enabled,
-                            self.config.sdrconnect_channel_bw_hz,
-                        );
-                        test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst)
-                    } else {
-                        raw_burst
-                    };
-                    let _ = self.cmd_tx.send(WorkerCommand::InjectSamples(burst));
+                    self.inject_test_pocsag();
                 }
                 if ui.button("Test FLEX 4-FSK (Phases A+B)").clicked() {
-                    let raw_burst = synthesize_flex_4fsk_burst(
-                        self.config.sample_rate,
-                        1_122_334,
-                        "FLEX PHASE-A 4-FSK DECODE OK",
-                        1_556_677,
-                        "FLEX PHASE-B 4-FSK UNLOCKED!",
-                        0.02,
-                    );
-                    let burst = if self.config.input_source == InputSource::SdrConnectIq {
-                        let iq_frame = synthesize_sdrconnect_iq_frame_from_baseband(
-                            &raw_burst,
-                            self.config.sample_rate,
-                            0.0,
-                        );
-                        let mut test_demod = IqFmDemodulator::new(
-                            self.config.sample_rate,
-                            self.config.sample_rate,
-                            self.config.sdrconnect_iq_gain,
-                            false,
-                            -90.0,
-                            self.config.sdrconnect_afc_enabled,
-                            self.config.sdrconnect_channel_bw_hz,
-                        );
-                        test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst)
-                    } else {
-                        raw_burst
-                    };
-                    let _ = self.cmd_tx.send(WorkerCommand::InjectSamples(burst));
+                    self.inject_test_flex();
                 }
             });
 
             ui.separator();
 
-            // Second toolbar row: Input status (Soundcard or SDRconnect IQ), Active Mode, RX-Q, and optional Scope
+            // Second toolbar row: Input status, Active Mode, RX-Q, Web Server Toggle/Port, and optional Scope
             ui.horizontal_wrapped(|ui| {
                 if let Some(sdr) = &self.sdrconnect_stream {
                     if let Ok(st) = sdr.status.try_lock() {
@@ -576,6 +684,53 @@ impl eframe::App for PdwApp {
                     .changed()
                 {
                     let _ = self.config.save(&self.config_path);
+                }
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.config.web_server_enabled, "Web")
+                    .on_hover_text("Toggle built-in Live Web Server (HTTP + SSE live stream with browser caching)")
+                    .changed()
+                {
+                    self.sync_web_server();
+                    let _ = self.config.save(&self.config_path);
+                }
+                let mut port_val = self.config.web_server_port as u32;
+                let port_resp = ui
+                    .add(
+                        egui::DragValue::new(&mut port_val)
+                            .prefix(":")
+                            .range(1..=65535)
+                            .speed(1.0),
+                    )
+                    .on_hover_text("Live Web Server TCP port (default: 8008). Type a port and press Enter to rebind.");
+                if port_resp.changed() {
+                    self.config.web_server_port = (port_val as u16).max(1);
+                }
+                if port_resp.drag_stopped() || port_resp.lost_focus() {
+                    self.sync_web_server();
+                    let _ = self.config.save(&self.config_path);
+                }
+                if let Some(srv) = &self.web_server {
+                    if let Ok(st) = srv.status.try_lock() {
+                        if let Some(err) = &st.error {
+                            ui.label(
+                                RichText::new(format!("({})", err))
+                                    .small()
+                                    .color(Color32::from_rgb(255, 95, 95)),
+                            );
+                        } else if st.running {
+                            let url = srv.display_url();
+                            if ui
+                                .small_button(
+                                    RichText::new(&url).color(Color32::from_rgb(90, 235, 130)),
+                                )
+                                .on_hover_text("Live Web Server active — click to copy URL to clipboard")
+                                .clicked()
+                            {
+                                ui.ctx().copy_text(url);
+                            }
+                        }
+                    }
                 }
                 ui.separator();
                 if ui
@@ -1492,8 +1647,106 @@ impl PdwApp {
                     "Enable Daily Filter Logfile (Logfiles/YYMMDD.flt)",
                 );
 
+                ui.separator();
+                ui.heading("Live Web Server & Browser Caching");
+                if ui
+                    .checkbox(
+                        &mut self.config.web_server_enabled,
+                        "Enable Built-In Live Web Server (HTTP + SSE Stream & Browser Cache)",
+                    )
+                    .changed()
+                {
+                    self.sync_web_server();
+                    let _ = self.config.save(&self.config_path);
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Web Server Port:");
+                    let mut port_u32 = self.config.web_server_port as u32;
+                    let p_resp = ui.add(
+                        egui::DragValue::new(&mut port_u32)
+                            .range(1..=65535)
+                            .speed(1.0),
+                    );
+                    if p_resp.changed() {
+                        self.config.web_server_port = (port_u32 as u16).max(1);
+                    }
+                    if p_resp.drag_stopped() || p_resp.lost_focus() {
+                        self.sync_web_server();
+                        let _ = self.config.save(&self.config_path);
+                    }
+                    if ui.small_button("Default (8008)").clicked() {
+                        self.config.web_server_port = DEFAULT_WEB_PORT;
+                        self.sync_web_server();
+                        let _ = self.config.save(&self.config_path);
+                    }
+                    ui.separator();
+                    ui.label("Bind:");
+                    egui::ComboBox::from_id_salt("web_bind_combo")
+                        .selected_text(if self.config.web_server_bind_addr == "127.0.0.1" {
+                            "127.0.0.1 (Localhost Only)"
+                        } else {
+                            "0.0.0.0 (LAN & Localhost)"
+                        })
+                        .width(175.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_value(
+                                    &mut self.config.web_server_bind_addr,
+                                    "0.0.0.0".to_string(),
+                                    "0.0.0.0 (LAN & Localhost)",
+                                )
+                                .clicked()
+                            {
+                                self.sync_web_server();
+                                let _ = self.config.save(&self.config_path);
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut self.config.web_server_bind_addr,
+                                    "127.0.0.1".to_string(),
+                                    "127.0.0.1 (Localhost Only)",
+                                )
+                                .clicked()
+                            {
+                                self.sync_web_server();
+                                let _ = self.config.save(&self.config_path);
+                            }
+                        });
+                });
+                if let Some(srv) = &self.web_server {
+                    if let Ok(st) = srv.status.try_lock() {
+                        if let Some(err) = &st.error {
+                            ui.colored_label(
+                                Color32::from_rgb(255, 95, 95),
+                                format!("Web Server Error: {}", err),
+                            );
+                        } else if st.running {
+                            let url = srv.display_url();
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    Color32::from_rgb(90, 235, 130),
+                                    format!(
+                                        "Active on {} (Bind {}:{} • Requests: {})",
+                                        url, st.bind_addr, st.port, st.requests_served
+                                    ),
+                                );
+                                if ui.small_button("Copy URL").clicked() {
+                                    ui.ctx().copy_text(url);
+                                }
+                            });
+                        }
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Web server is currently disabled.")
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
+
                 ui.add_space(8.0);
                 if ui.button("Save & Apply").clicked() {
+                    self.sync_web_server();
                     let _ = self
                         .cmd_tx
                         .send(WorkerCommand::UpdateConfig(self.config.clone()));
@@ -1856,7 +2109,7 @@ fn run_dsp_worker(
     }
 }
 
-/// Exact port of `Audio_To_Bits` (`sound_in.cpp:387–623`), running `pocsag_atb` (`Pocsag.cpp`)
+/// Exact port of `Audio_To_Bits` (`sound_in.cpp:396–623`), running `pocsag_atb` (`Pocsag.cpp`)
 /// and `flex_atb` (`Flex.cpp`) concurrently in parallel so neither protocol ever locks out the other.
 #[allow(clippy::too_many_arguments)]
 pub fn process_audio_chunk(

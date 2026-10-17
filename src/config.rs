@@ -138,6 +138,11 @@ pub struct AppConfig {
     // UI split ratio (percentage for upper monitor pane)
     pub upper_pane_percent: f32,
 
+    // Built-in Live Web Server settings (default: enabled on port 8008)
+    pub web_server_enabled: bool,
+    pub web_server_port: u16,
+    pub web_server_bind_addr: String,
+
     // Filter rules
     pub filters: Vec<FilterRule>,
 }
@@ -185,6 +190,9 @@ impl Default for AppConfig {
             filter_logfile_enabled: false,
             log_dir: "Logfiles".to_string(),
             upper_pane_percent: 65.0,
+            web_server_enabled: true,
+            web_server_port: crate::web::DEFAULT_WEB_PORT,
+            web_server_bind_addr: crate::web::DEFAULT_WEB_BIND_ADDR.to_string(),
             filters: Vec::new(),
         }
     }
@@ -210,6 +218,12 @@ impl AppConfig {
                 // Reset excessive IQ gain (> 2.0) that could clip 4-FSK outer symbols
                 if cfg.sdrconnect_iq_gain > 2.0 || cfg.sdrconnect_iq_gain < 0.25 {
                     cfg.sdrconnect_iq_gain = 1.0;
+                }
+                if cfg.web_server_port == 0 {
+                    cfg.web_server_port = crate::web::DEFAULT_WEB_PORT;
+                }
+                if cfg.web_server_bind_addr.trim().is_empty() {
+                    cfg.web_server_bind_addr = crate::web::DEFAULT_WEB_BIND_ADDR.to_string();
                 }
                 return cfg;
             }

@@ -1,4 +1,4 @@
-//! `pdw-rs`: Modern Rust POCSAG & FLEX Paging Decoder with 48 kHz / 44.1 kHz Audio DSP & Local GUI
+//! `pdw-rs`: Modern Rust POCSAG & FLEX Paging Decoder with 48 kHz / 44.1 kHz Audio DSP, Local GUI & Live Web Server
 
 pub mod audio;
 pub mod bch;
@@ -8,14 +8,15 @@ pub mod flex;
 pub mod gui;
 pub mod pocsag;
 pub mod sdrconnect;
+pub mod web;
 
 use gui::PdwApp;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("PDW-RS v0.2.5 — POCSAG & FLEX (2/4-FSK) Decoder (Soundcard & SDRconnect IQ)")
-            .with_inner_size([1080.0, 680.0])
+            .with_title("PDW-RS v0.3.0 — POCSAG & FLEX (2/4-FSK) Decoder (Soundcard, SDRconnect IQ & Live Web Server)")
+            .with_inner_size([1120.0, 680.0])
             .with_min_inner_size([720.0, 420.0]),
         ..Default::default()
     };
@@ -365,44 +366,27 @@ mod tests {
             w | xsum
         };
 
-        // Build a frame containing:
-        // 1) A 9-digit Long-Address ALPHA message at words 1..=2 (address) and 3..=4 (vector + header),
-        //    with 2 character words at words 6..=7 ("LONG9OK!"), AND 3 weak bit errors in BIW (word 0)
-        //    and 3 weak bit errors in Vector word (word 3)!
-        // 2) A Short-Address Numeric (StNUM, vt=3) message at word 5 (vector) and word 8 (1 numeric word: "1234"),
-        //    followed by idle word 0x1f_ffff at word 9 to verify no trailing '[' off-by-one leak!
-        // BIW: asa = 1 (bits 8..9 = 0), vsa = 4 (3 address words: 1..=2 for long addr, 3 for short addr -> wait: vsa = 4 means j = 1, 2, 3)
         let biw = add_xsum((4 << 10) | (0 << 8));
-        encode_flex_word(&mut phase, 0, biw, &[2, 9, 17]); // 3 bit errors in BIW!
+        encode_flex_word(&mut phase, 0, biw, &[2, 9, 17]);
         assert!(!FlexDecoder::xsumchk(phase.frame_words[0]), "Hard BCH should fail on 3-bit BIW error");
 
-        // 9-digit long capcode: l1 = 100 (cc2 < 0x008001 -> is_long = true), l2 = 0x1f_fffe
-        encode_flex_word(&mut phase, 1, 100, &[1, 8, 15]); // 3 bit errors in Long Address word 1!
+        encode_flex_word(&mut phase, 1, 100, &[1, 8, 15]);
         encode_flex_word(&mut phase, 2, 0x1f_fffe, &[]);
 
-        // Vector for Long-Address Alpha at vb = 4 + 1 - 1 = 4, and second vector/header word at vb + 1 = 5:
-        // vt = 5 (ALPHA), w1 = 7, len = 2 words (words 7 and 8)
         let vec_long = add_xsum((5 << 4) | (7 << 7) | (2 << 14));
-        encode_flex_word(&mut phase, 4, vec_long, &[3, 11, 19]); // 3 bit errors in Vector word!
-        encode_flex_word(&mut phase, 5, 3 << 11, &[]); // fragment_num = 3 in frame[vb + 1]
+        encode_flex_word(&mut phase, 4, vec_long, &[3, 11, 19]);
+        encode_flex_word(&mut phase, 5, 3 << 11, &[]);
 
-        // Word 7 (first char word of long-addr msg): sig 0x7f + 'L' + 'O'
         let w7 = 0x7f | ((b'L' as u32) << 7) | ((b'O' as u32) << 14);
-        // Word 8 (second char word of long-addr msg — previously truncated by w2.saturating_sub(1)!): 'N' + 'G' + '9'
         let w8 = (b'N' as u32) | ((b'G' as u32) << 7) | ((b'9' as u32) << 14);
         encode_flex_word(&mut phase, 7, w7, &[]);
         encode_flex_word(&mut phase, 8, w8, &[]);
 
-        // Short-Address Numeric (StNUM, vt = 3) at j = 3, vb = 4 + 3 - 1 = 6:
-        // Capcode 1234567 -> l1 = 1234567 + 32768
         encode_flex_word(&mut phase, 3, 1_234_567 + 32_768, &[]);
-        // StNUM vector: vt = 3, w1 = 9, extra_words = 0 (1 word total at word 9; word 10 is idle 0x1f_ffff = '[')
         let vec_num = add_xsum((3 << 4) | (9 << 7) | (0 << 14));
         encode_flex_word(&mut phase, 6, vec_num, &[]);
-        // Pack 2 header bits (0) + Four 4-bit BCD digits '1', '2', '3', '4' + trailing space (0xC) into 21-bit word 9
         let w9: u32 = (1 << 2) | (2 << 6) | (3 << 10) | (4 << 14) | (0x0C << 18);
         encode_flex_word(&mut phase, 9, w9, &[]);
-        // Word 10 is left as 0x1f_ffff (all 1s = '[' in NUMERIC_TABLE)
 
         let mut group_frame = [-1i16; 16];
         let mut group_capcodes: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());

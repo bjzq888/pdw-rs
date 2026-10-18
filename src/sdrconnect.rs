@@ -1,11 +1,13 @@
-//! Direct SDRconnect WebSocket IQ Client & DC-Coupled Quadrature FM Discriminator.
+//! Direct SDRconnect WebSocket IQ Client, Parallel Multi-Channel NCO DDC Bank,
+//! & DC-Coupled Quadrature FM Discriminator (`sdrconnect.rs`).
 //!
 //! Connects directly to a running local (or LAN) SDRconnect instance over its built-in
 //! WebSocket API (`ws://127.0.0.1:5454/` by default), enables the raw IQ stream
 //! (`iq_stream_enable`, Binary Frame Type `0x0002` / `0x0005` interleaved `i16` IQ samples)
 //! or VFO Audio stream (`audio_stream_enable`, Binary Frame Type `0x0001` / `0x0004`),
-//! and performs DC-coupled quadrature polar FM demodulation (`atan2`) into `f32` baseband
-//! samples for the POCSAG and FLEX (2-FSK / 4-FSK) DSP decoders.
+//! and performs parallel multi-frequency NCO downconversion and DC-coupled quadrature
+//! polar FM demodulation (`atan2`) into per-channel `f32` baseband streams for the
+//! POCSAG and FLEX (2-FSK / 4-FSK) DSP decoders.
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::io::{self, Read, Write};
@@ -25,11 +27,19 @@ pub const SDRCONNECT_BIN_AUDIO_SECONDARY: u16 = 4;
 pub const SDRCONNECT_BIN_IQ_SECONDARY: u16 = 5;
 
 #[derive(Clone, Debug)]
+pub struct DemodAudioChunk {
+    pub freq_hz: Option<u64>,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
 pub struct SdrConnectStatus {
     pub connected: bool,
     pub status_text: String,
     pub vfo_freq_hz: Option<u64>,
     pub center_freq_hz: Option<u64>,
+    pub active_frequencies_hz: Vec<u64>,
+    pub parallel_mode_desc: String,
     pub iq_sample_rate: u32,
     pub measured_iq_rate: u32,
     pub device_sample_rate: Option<u32>,
@@ -51,6 +61,8 @@ impl Default for SdrConnectStatus {
             status_text: "Disconnected".to_string(),
             vfo_freq_hz: None,
             center_freq_hz: None,
+            active_frequencies_hz: Vec::new(),
+            parallel_mode_desc: String::new(),
             iq_sample_rate: 48_000,
             measured_iq_rate: 0,
             device_sample_rate: None,
@@ -72,6 +84,7 @@ pub enum SdrConnectControlCmd {
     SetVfoFrequency(u64),
     SetCenterFrequency(u64),
     SetFilterBandwidth(u32),
+    SetMonitoredFrequencies(Vec<u64>),
     UpdateDemodParams {
         iq_gain: f32,
         squelch_enabled: bool,
@@ -94,6 +107,7 @@ pub struct SdrConnectParams {
     pub channel_bw_hz: f32,
     pub tune_on_connect: bool,
     pub initial_vfo_freq_hz: u64,
+    pub monitored_freqs_hz: Vec<u64>,
     pub use_audio_stream: bool,
 }
 
@@ -178,7 +192,7 @@ pub struct IqFmDemodulator {
     pub afc_enabled: bool,
     pub channel_bw_hz: f32,
 
-    // Complex NCO for mixing wideband Type-2 IQ (`center_freq_hz` -> `vfo_freq_hz`)
+    // Complex NCO for mixing a channel offset (`f_channel - f_ref`) down to 0 Hz baseband
     pub nco_offset_hz: f64,
     nco_phase: f64,
 
@@ -335,8 +349,9 @@ impl IqFmDemodulator {
             (out_rate_f as f32) / (2.0 * std::f32::consts::PI * 6_400.0);
         let squelch_lin = 10.0_f32.powf(self.squelch_dbfs / 10.0);
 
-        // Apply NCO mixing when receiving wideband hardware IQ (`input_rate > 96_000`) and VFO != LO center
-        let use_nco = self.input_rate > 96_000 && self.nco_offset_hz.abs() > 1.0;
+        // Apply complex NCO rotation whenever the target channel offset lies within the Nyquist passband
+        let use_nco =
+            self.nco_offset_hz.abs() > 1.0 && self.nco_offset_hz.abs() <= in_rate_f * 0.48;
         let nco_step = -2.0 * std::f64::consts::PI * self.nco_offset_hz / in_rate_f;
 
         for chunk in iq_bytes.chunks_exact(4) {
@@ -468,6 +483,114 @@ impl IqFmDemodulator {
     }
 }
 
+/// Multi-Channel IQ Demodulator Bank that decodes an arbitrary list of frequencies in parallel
+/// from a shared IQ stream using independent per-channel NCO mixers and Butterworth filters.
+#[derive(Clone, Debug)]
+pub struct MultiChannelIqDemodulator {
+    pub reference_freq_hz: u64,
+    pub channels: Vec<(u64, IqFmDemodulator)>,
+}
+
+impl MultiChannelIqDemodulator {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        frequencies_hz: &[u64],
+        reference_freq_hz: u64,
+        input_rate: u32,
+        output_rate: u32,
+        iq_gain: f32,
+        squelch_enabled: bool,
+        squelch_dbfs: f32,
+        afc_enabled: bool,
+        channel_bw_hz: f32,
+    ) -> Self {
+        let mut channels = Vec::with_capacity(frequencies_hz.len().max(1));
+        for &freq_hz in frequencies_hz {
+            let mut demod = IqFmDemodulator::new(
+                input_rate,
+                output_rate,
+                iq_gain,
+                squelch_enabled,
+                squelch_dbfs,
+                afc_enabled,
+                channel_bw_hz,
+            );
+            demod.nco_offset_hz = (freq_hz as f64) - (reference_freq_hz as f64);
+            channels.push((freq_hz, demod));
+        }
+        Self {
+            reference_freq_hz,
+            channels,
+        }
+    }
+
+    pub fn set_reference_freq(&mut self, reference_freq_hz: u64) {
+        self.reference_freq_hz = reference_freq_hz;
+        for (freq_hz, demod) in &mut self.channels {
+            demod.nco_offset_hz = (*freq_hz as f64) - (reference_freq_hz as f64);
+        }
+    }
+
+    pub fn set_rates(&mut self, input_rate: u32, output_rate: u32) {
+        for (_, demod) in &mut self.channels {
+            demod.set_rates(input_rate, output_rate);
+        }
+    }
+
+    pub fn update_params(
+        &mut self,
+        iq_gain: f32,
+        squelch_enabled: bool,
+        squelch_dbfs: f32,
+        afc_enabled: bool,
+        channel_bw_hz: f32,
+    ) {
+        for (_, demod) in &mut self.channels {
+            demod.iq_gain = iq_gain.clamp(0.25, 3.0);
+            demod.squelch_enabled = squelch_enabled;
+            demod.squelch_dbfs = squelch_dbfs;
+            demod.afc_enabled = afc_enabled;
+            demod.channel_bw_hz = channel_bw_hz.clamp(12_500.0, 36_000.0);
+            demod.recompute_filters();
+        }
+    }
+
+    pub fn rebuild_channels(&mut self, frequencies_hz: &[u64], default_template: &IqFmDemodulator) {
+        let mut next_channels = Vec::with_capacity(frequencies_hz.len().max(1));
+        for &freq_hz in frequencies_hz {
+            if let Some(pos) = self.channels.iter().position(|(f, _)| *f == freq_hz) {
+                let (_, mut existing) = self.channels.remove(pos);
+                existing.nco_offset_hz = (freq_hz as f64) - (self.reference_freq_hz as f64);
+                next_channels.push((freq_hz, existing));
+            } else {
+                let mut d = default_template.clone();
+                d.nco_offset_hz = (freq_hz as f64) - (self.reference_freq_hz as f64);
+                next_channels.push((freq_hz, d));
+            }
+        }
+        self.channels = next_channels;
+    }
+
+    /// Demodulate all in-band channels in parallel from a single binary IQ frame.
+    pub fn process_binary_frame(&mut self, frame: &[u8]) -> Vec<DemodAudioChunk> {
+        let mut results = Vec::with_capacity(self.channels.len());
+        for (freq_hz, demod) in &mut self.channels {
+            let max_nyquist_offset = (demod.input_rate as f64) * 0.48;
+            if demod.nco_offset_hz.abs() <= max_nyquist_offset {
+                if let Some(samples) = demod.process_binary_frame(frame) {
+                    if !samples.is_empty() {
+                        results.push(DemodAudioChunk {
+                            freq_hz: Some(*freq_hz),
+                            samples,
+                        });
+                    }
+                }
+            }
+        }
+        results
+    }
+}
+
 /// Snap an empirically measured incoming sample rate to the nearest standard SDR sample rate.
 fn snap_measured_sample_rate(measured: u32, reported_device_sr: Option<u32>) -> u32 {
     if let Some(dev_sr) = reported_device_sr {
@@ -493,7 +616,7 @@ fn snap_measured_sample_rate(measured: u32, reported_device_sr: Option<u32>) -> 
 
 pub fn start_sdrconnect_iq_capture(
     params: SdrConnectParams,
-    sample_tx: Sender<Vec<f32>>,
+    chunk_tx: Sender<DemodAudioChunk>,
 ) -> SdrConnectStream {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let (ctrl_tx, ctrl_rx) = bounded::<SdrConnectControlCmd>(32);
@@ -503,6 +626,7 @@ pub fn start_sdrconnect_iq_capture(
             "Connecting to SDRconnect ws://{}:{}/ ...",
             params.host, params.port
         ),
+        active_frequencies_hz: params.monitored_freqs_hz.clone(),
         iq_sample_rate: params.target_sample_rate,
         ..Default::default()
     }));
@@ -511,7 +635,7 @@ pub fn start_sdrconnect_iq_capture(
     let status_clone = Arc::clone(&status);
 
     let worker = thread::spawn(move || {
-        sdrconnect_worker_loop(params, sample_tx, ctrl_rx, stop_clone, status_clone);
+        sdrconnect_worker_loop(params, chunk_tx, ctrl_rx, stop_clone, status_clone);
     });
 
     SdrConnectStream {
@@ -522,14 +646,27 @@ pub fn start_sdrconnect_iq_capture(
     }
 }
 
+fn compute_midpoint_and_span(freqs: &[u64], fallback: u64) -> (u64, u64) {
+    if freqs.is_empty() {
+        return (fallback, 0);
+    }
+    let min_f = freqs.iter().copied().min().unwrap_or(fallback);
+    let max_f = freqs.iter().copied().max().unwrap_or(fallback);
+    ((min_f + max_f) / 2, max_f - min_f)
+}
+
 fn sdrconnect_worker_loop(
     mut params: SdrConnectParams,
-    sample_tx: Sender<Vec<f32>>,
+    chunk_tx: Sender<DemodAudioChunk>,
     ctrl_rx: Receiver<SdrConnectControlCmd>,
     stop_flag: Arc<AtomicBool>,
     status: Arc<Mutex<SdrConnectStatus>>,
 ) {
-    let mut demod = IqFmDemodulator::new(
+    if params.monitored_freqs_hz.is_empty() {
+        params.monitored_freqs_hz.push(params.initial_vfo_freq_hz.max(929_612_500));
+    }
+
+    let mut template_demod = IqFmDemodulator::new(
         params.target_sample_rate,
         params.target_sample_rate,
         params.iq_gain,
@@ -538,6 +675,21 @@ fn sdrconnect_worker_loop(
         params.afc_enabled,
         params.channel_bw_hz,
     );
+
+    let (initial_mid, _) =
+        compute_midpoint_and_span(&params.monitored_freqs_hz, params.initial_vfo_freq_hz);
+    let mut multi_demod = MultiChannelIqDemodulator::new(
+        &params.monitored_freqs_hz,
+        params.monitored_freqs_hz[0],
+        params.target_sample_rate,
+        params.target_sample_rate,
+        params.iq_gain,
+        params.squelch_enabled,
+        params.squelch_dbfs,
+        params.afc_enabled,
+        params.channel_bw_hz,
+    );
+    let _ = initial_mid;
 
     while !stop_flag.load(Ordering::Relaxed) {
         if let Ok(mut st) = status.lock() {
@@ -552,19 +704,36 @@ fn sdrconnect_worker_loop(
             Ok(mut ws) => {
                 if let Ok(mut st) = status.lock() {
                     st.connected = true;
+                    st.active_frequencies_hz = params.monitored_freqs_hz.clone();
                     st.status_text = format!(
-                        "SDRconnect {} Active (ws://{}:{}/)",
+                        "SDRconnect {} Active ({} ch)",
                         if params.use_audio_stream { "Audio" } else { "IQ" },
-                        params.host,
-                        params.port
+                        params.monitored_freqs_hz.len()
                     );
                 }
 
-                if params.tune_on_connect && params.initial_vfo_freq_hz > 0 {
+                let (mid_hz, span_hz) = compute_midpoint_and_span(
+                    &params.monitored_freqs_hz,
+                    params.initial_vfo_freq_hz,
+                );
+                let primary_hz = params
+                    .monitored_freqs_hz
+                    .first()
+                    .copied()
+                    .unwrap_or(params.initial_vfo_freq_hz);
+
+                if (params.tune_on_connect || params.monitored_freqs_hz.len() > 1) && primary_hz > 0 {
+                    if span_hz > 0 {
+                        let _ = ws.send_json_cmd(
+                            "set_property",
+                            "device_center_frequency",
+                            &mid_hz.to_string(),
+                        );
+                    }
                     let _ = ws.send_json_cmd(
                         "set_property",
                         "device_vfo_frequency",
-                        &params.initial_vfo_freq_hz.to_string(),
+                        &primary_hz.to_string(),
                     );
                 }
 
@@ -597,16 +766,31 @@ fn sdrconnect_worker_loop(
                 let mut rate_window_samples: u64 = 0;
                 let mut iq_frames: u64 = 0;
 
+                // Software VFO scanner state when SDRconnect streams narrowband 48 kHz VFO IQ
+                // across channels separated by > 24 kHz within the 2 MHz hardware passband
+                let mut active_scan_idx: usize = 0;
+                let mut last_scan_step = Instant::now();
+                let mut last_carrier_seen = Instant::now();
+
                 while !stop_flag.load(Ordering::Relaxed) {
                     while let Ok(cmd) = ctrl_rx.try_recv() {
                         match cmd {
                             SdrConnectControlCmd::SetVfoFrequency(hz) => {
                                 params.initial_vfo_freq_hz = hz;
+                                if params.monitored_freqs_hz.is_empty() {
+                                    params.monitored_freqs_hz.push(hz);
+                                } else {
+                                    params.monitored_freqs_hz[0] = hz;
+                                }
+                                multi_demod.rebuild_channels(
+                                    &params.monitored_freqs_hz,
+                                    &template_demod,
+                                );
                                 let need_recenter = status
                                     .lock()
                                     .ok()
                                     .and_then(|st| st.center_freq_hz)
-                                    .map(|cf| cf.abs_diff(hz) > 400_000)
+                                    .map(|cf| cf.abs_diff(hz) > 900_000)
                                     .unwrap_or(false);
                                 if need_recenter {
                                     let _ = ws.send_json_cmd(
@@ -623,6 +807,54 @@ fn sdrconnect_worker_loop(
                                 let _ = ws.send_json_cmd("get_property", "device_vfo_frequency", "");
                                 let _ =
                                     ws.send_json_cmd("get_property", "device_center_frequency", "");
+                            }
+                            SdrConnectControlCmd::SetMonitoredFrequencies(new_freqs) => {
+                                if !new_freqs.is_empty() {
+                                    params.monitored_freqs_hz = new_freqs;
+                                    params.initial_vfo_freq_hz = params.monitored_freqs_hz[0];
+                                    multi_demod.rebuild_channels(
+                                        &params.monitored_freqs_hz,
+                                        &template_demod,
+                                    );
+                                    let (mid, _) = compute_midpoint_and_span(
+                                        &params.monitored_freqs_hz,
+                                        params.initial_vfo_freq_hz,
+                                    );
+                                    let need_recenter = status
+                                        .lock()
+                                        .ok()
+                                        .and_then(|st| st.center_freq_hz)
+                                        .map(|cf| {
+                                            params
+                                                .monitored_freqs_hz
+                                                .iter()
+                                                .any(|&f| cf.abs_diff(f) > 950_000)
+                                        })
+                                        .unwrap_or(true);
+                                    if need_recenter {
+                                        let _ = ws.send_json_cmd(
+                                            "set_property",
+                                            "device_center_frequency",
+                                            &mid.to_string(),
+                                        );
+                                    }
+                                    let _ = ws.send_json_cmd(
+                                        "set_property",
+                                        "device_vfo_frequency",
+                                        &params.monitored_freqs_hz[0].to_string(),
+                                    );
+                                    let _ =
+                                        ws.send_json_cmd("get_property", "device_vfo_frequency", "");
+                                    let _ = ws.send_json_cmd(
+                                        "get_property",
+                                        "device_center_frequency",
+                                        "",
+                                    );
+                                    if let Ok(mut st) = status.lock() {
+                                        st.active_frequencies_hz =
+                                            params.monitored_freqs_hz.clone();
+                                    }
+                                }
                             }
                             SdrConnectControlCmd::SetCenterFrequency(hz) => {
                                 let _ = ws.send_json_cmd(
@@ -649,12 +881,20 @@ fn sdrconnect_worker_loop(
                                 channel_bw_hz,
                                 use_audio_stream,
                             } => {
-                                demod.iq_gain = iq_gain.clamp(0.25, 3.0);
-                                demod.squelch_enabled = squelch_enabled;
-                                demod.squelch_dbfs = squelch_dbfs;
-                                demod.afc_enabled = afc_enabled;
-                                demod.channel_bw_hz = channel_bw_hz.clamp(12_500.0, 36_000.0);
-                                demod.recompute_filters();
+                                template_demod.iq_gain = iq_gain.clamp(0.25, 3.0);
+                                template_demod.squelch_enabled = squelch_enabled;
+                                template_demod.squelch_dbfs = squelch_dbfs;
+                                template_demod.afc_enabled = afc_enabled;
+                                template_demod.channel_bw_hz =
+                                    channel_bw_hz.clamp(12_500.0, 36_000.0);
+                                template_demod.recompute_filters();
+                                multi_demod.update_params(
+                                    iq_gain,
+                                    squelch_enabled,
+                                    squelch_dbfs,
+                                    afc_enabled,
+                                    channel_bw_hz,
+                                );
                                 if use_audio_stream != params.use_audio_stream {
                                     params.use_audio_stream = use_audio_stream;
                                     if params.use_audio_stream {
@@ -690,37 +930,130 @@ fn sdrconnect_worker_loop(
                                 rate_window_samples = 0;
                                 let dev_sr = status.lock().ok().and_then(|s| s.device_sample_rate);
                                 let snapped = snap_measured_sample_rate(raw_r, dev_sr);
-                                let out_sr = demod.output_rate;
-                                demod.set_rates(snapped, out_sr);
+                                let out_sr = template_demod.output_rate;
+                                template_demod.set_rates(snapped, out_sr);
+                                multi_demod.set_rates(snapped, out_sr);
                                 Some(snapped)
                             } else {
                                 None
                             };
 
-                            if let Some(samples) = demod.process_binary_frame(&bin) {
-                                iq_frames = iq_frames.wrapping_add(1);
-                                if !samples.is_empty() {
-                                    let _ = sample_tx.try_send(samples);
-                                }
+                            // Update reference frequency of the incoming IQ stream:
+                            // - When wideband IQ (`input_rate > 96_000`), reference is `center_freq_hz`.
+                            // - When narrowband VFO IQ (`input_rate <= 96_000`), reference is `vfo_freq_hz`.
+                            let (cur_vfo_opt, cur_center_opt) = status
+                                .try_lock()
+                                .ok()
+                                .map(|s| (s.vfo_freq_hz, s.center_freq_hz))
+                                .unwrap_or((None, None));
+                            let current_in_rate = template_demod.input_rate;
+                            let ref_hz = if current_in_rate > 96_000 {
+                                cur_center_opt
+                                    .or(cur_vfo_opt)
+                                    .unwrap_or(params.monitored_freqs_hz[0])
+                            } else {
+                                cur_vfo_opt.unwrap_or_else(|| {
+                                    params
+                                        .monitored_freqs_hz
+                                        .get(active_scan_idx % params.monitored_freqs_hz.len().max(1))
+                                        .copied()
+                                        .unwrap_or(params.initial_vfo_freq_hz)
+                                })
+                            };
+                            multi_demod.set_reference_freq(ref_hz);
 
-                                if last_telem_push.elapsed() >= Duration::from_millis(200) {
-                                    last_telem_push = Instant::now();
-                                    if let Ok(mut st) = status.try_lock() {
-                                        st.iq_rssi_dbfs = demod.rssi_dbfs;
-                                        st.squelch_open = demod.squelch_open;
-                                        st.carrier_detected = demod.carrier_detected;
-                                        st.afc_offset_hz = demod.afc_offset_hz();
-                                        st.iq_frames_received = iq_frames;
-                                        if let Some(msr) = measured_sr {
-                                            st.measured_iq_rate = msr;
-                                            st.iq_sample_rate = msr;
-                                        }
+                            let chunks = multi_demod.process_binary_frame(&bin);
+                            if !chunks.is_empty() {
+                                iq_frames = iq_frames.wrapping_add(1);
+                                for ch_chunk in chunks {
+                                    let _ = chunk_tx.try_send(ch_chunk);
+                                }
+                            }
+
+                            // Check if any channel has an active carrier
+                            let any_carrier = multi_demod
+                                .channels
+                                .iter()
+                                .any(|(_, d)| d.carrier_detected);
+                            if any_carrier {
+                                last_carrier_seen = Instant::now();
+                            }
+
+                            // If multiple frequencies are enabled and the IQ stream is narrower than
+                            // their frequency separation, step SDRconnect's software VFO across the
+                            // enabled frequencies whenever idle (zero hardware LO retuning!).
+                            let (_, span_hz) = compute_midpoint_and_span(
+                                &params.monitored_freqs_hz,
+                                params.initial_vfo_freq_hz,
+                            );
+                            let stream_covers_all =
+                                (span_hz as f64) <= (current_in_rate as f64) * 0.90;
+
+                            if !stream_covers_all
+                                && params.monitored_freqs_hz.len() > 1
+                                && !any_carrier
+                                && last_carrier_seen.elapsed() >= Duration::from_millis(260)
+                                && last_scan_step.elapsed() >= Duration::from_millis(190)
+                            {
+                                last_scan_step = Instant::now();
+                                active_scan_idx =
+                                    (active_scan_idx + 1) % params.monitored_freqs_hz.len();
+                                let next_vfo = params.monitored_freqs_hz[active_scan_idx];
+                                let _ = ws.send_json_cmd(
+                                    "set_property",
+                                    "device_vfo_frequency",
+                                    &next_vfo.to_string(),
+                                );
+                                if let Ok(mut st) = status.try_lock() {
+                                    st.vfo_freq_hz = Some(next_vfo);
+                                }
+                            }
+
+                            if last_telem_push.elapsed() >= Duration::from_millis(200) {
+                                last_telem_push = Instant::now();
+                                if let Ok(mut st) = status.try_lock() {
+                                    if let Some((_, primary_d)) = multi_demod
+                                        .channels
+                                        .iter()
+                                        .find(|(_, d)| d.carrier_detected)
+                                        .or_else(|| multi_demod.channels.first())
+                                    {
+                                        st.iq_rssi_dbfs = primary_d.rssi_dbfs;
+                                        st.squelch_open = primary_d.squelch_open;
+                                        st.carrier_detected = any_carrier;
+                                        st.afc_offset_hz = primary_d.afc_offset_hz();
+                                    }
+                                    st.iq_frames_received = iq_frames;
+                                    st.active_frequencies_hz = params.monitored_freqs_hz.clone();
+                                    st.parallel_mode_desc = if params.monitored_freqs_hz.len() <= 1
+                                    {
+                                        "Single VFO".to_string()
+                                    } else if stream_covers_all {
+                                        format!(
+                                            "{} ch Parallel DDC",
+                                            params.monitored_freqs_hz.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "{} ch Parallel VFO Mux",
+                                            params.monitored_freqs_hz.len()
+                                        )
+                                    };
+                                    if let Some(msr) = measured_sr {
+                                        st.measured_iq_rate = msr;
+                                        st.iq_sample_rate = msr;
                                     }
                                 }
                             }
                         }
                         Ok(Some(WsMessage::Text(txt))) => {
-                            handle_sdrconnect_json_event(&txt, &mut ws, &mut demod, &status);
+                            handle_sdrconnect_json_event(
+                                &txt,
+                                &mut ws,
+                                &mut template_demod,
+                                &mut multi_demod,
+                                &status,
+                            );
                         }
                         Ok(None) => {}
                         Err(e) => {
@@ -753,22 +1086,38 @@ fn sdrconnect_worker_loop(
                 break;
             }
             while let Ok(cmd) = ctrl_rx.try_recv() {
-                if let SdrConnectControlCmd::UpdateDemodParams {
-                    iq_gain,
-                    squelch_enabled,
-                    squelch_dbfs,
-                    afc_enabled,
-                    channel_bw_hz,
-                    use_audio_stream,
-                } = cmd
-                {
-                    demod.iq_gain = iq_gain.clamp(0.25, 3.0);
-                    demod.squelch_enabled = squelch_enabled;
-                    demod.squelch_dbfs = squelch_dbfs;
-                    demod.afc_enabled = afc_enabled;
-                    demod.channel_bw_hz = channel_bw_hz.clamp(12_500.0, 36_000.0);
-                    demod.recompute_filters();
-                    params.use_audio_stream = use_audio_stream;
+                match cmd {
+                    SdrConnectControlCmd::UpdateDemodParams {
+                        iq_gain,
+                        squelch_enabled,
+                        squelch_dbfs,
+                        afc_enabled,
+                        channel_bw_hz,
+                        use_audio_stream,
+                    } => {
+                        template_demod.iq_gain = iq_gain.clamp(0.25, 3.0);
+                        template_demod.squelch_enabled = squelch_enabled;
+                        template_demod.squelch_dbfs = squelch_dbfs;
+                        template_demod.afc_enabled = afc_enabled;
+                        template_demod.channel_bw_hz = channel_bw_hz.clamp(12_500.0, 36_000.0);
+                        template_demod.recompute_filters();
+                        multi_demod.update_params(
+                            iq_gain,
+                            squelch_enabled,
+                            squelch_dbfs,
+                            afc_enabled,
+                            channel_bw_hz,
+                        );
+                        params.use_audio_stream = use_audio_stream;
+                    }
+                    SdrConnectControlCmd::SetMonitoredFrequencies(new_freqs) => {
+                        if !new_freqs.is_empty() {
+                            params.monitored_freqs_hz = new_freqs;
+                            multi_demod
+                                .rebuild_channels(&params.monitored_freqs_hz, &template_demod);
+                        }
+                    }
+                    _ => {}
                 }
             }
             thread::sleep(Duration::from_millis(100));
@@ -779,7 +1128,8 @@ fn sdrconnect_worker_loop(
 fn handle_sdrconnect_json_event(
     json_text: &str,
     ws: &mut WsClient,
-    demod: &mut IqFmDemodulator,
+    template_demod: &mut IqFmDemodulator,
+    multi_demod: &mut MultiChannelIqDemodulator,
     status: &Arc<Mutex<SdrConnectStatus>>,
 ) {
     let event_type = extract_json_str_field(json_text, "event_type").unwrap_or_default();
@@ -807,8 +1157,9 @@ fn handle_sdrconnect_json_event(
                 if let Ok(sr) = val.trim().parse::<u32>() {
                     if sr >= 8_000 {
                         st.iq_sample_rate = sr;
-                        let out_sr = demod.output_rate;
-                        demod.set_rates(sr, out_sr);
+                        let out_sr = template_demod.output_rate;
+                        template_demod.set_rates(sr, out_sr);
+                        multi_demod.set_rates(sr, out_sr);
                     }
                 }
             }
@@ -840,10 +1191,6 @@ fn handle_sdrconnect_json_event(
                 }
             }
             _ => {}
-        }
-
-        if let (Some(vfo), Some(center)) = (st.vfo_freq_hz, st.center_freq_hz) {
-            demod.nco_offset_hz = (vfo as f64) - (center as f64);
         }
     }
 
@@ -1154,6 +1501,48 @@ pub fn synthesize_sdrconnect_iq_frame_from_baseband(
         let i_val = (phase.cos() * 22_937.0).round().clamp(-32767.0, 32767.0) as i16;
         let q_val = (phase.sin() * 22_937.0).round().clamp(-32767.0, 32767.0) as i16;
 
+        frame.extend_from_slice(&i_val.to_le_bytes());
+        frame.extend_from_slice(&q_val.to_le_bytes());
+    }
+
+    frame
+}
+
+/// Synthesize a composite wideband SDRconnect Type-2 IQ frame containing multiple simultaneous
+/// FM paging carriers at distinct frequency offsets `(carrier_offset_hz, baseband_samples)`.
+pub fn synthesize_multi_channel_sdrconnect_iq_frame(
+    carriers: &[(f64, &[f32])],
+    iq_sample_rate: u32,
+    baseband_sample_rate: u32,
+) -> Vec<u8> {
+    let max_base_len = carriers.iter().map(|(_, b)| b.len()).max().unwrap_or(0);
+    let ratio = (iq_sample_rate.max(8_000) as f64) / (baseband_sample_rate.max(8_000) as f64);
+    let total_iq_samples = ((max_base_len as f64) * ratio).ceil() as usize;
+
+    let mut frame = Vec::with_capacity(2 + total_iq_samples * 4);
+    frame.extend_from_slice(&SDRCONNECT_BIN_IQ_PRIMARY.to_le_bytes());
+
+    let mut phases = vec![0.0f64; carriers.len()];
+    let sr = iq_sample_rate.max(8_000) as f64;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    let scale_per_carrier = 20_000.0 / (carriers.len().max(1) as f64);
+
+    for iq_idx in 0..total_iq_samples {
+        let base_idx = ((iq_idx as f64) / ratio).floor() as usize;
+        let mut sum_i = 0.0f64;
+        let mut sum_q = 0.0f64;
+
+        for (c_idx, &(offset_hz, baseband)) in carriers.iter().enumerate() {
+            let s = baseband.get(base_idx).copied().unwrap_or(0.0) as f64;
+            // Channel at +offset_hz has carrier frequency +offset_hz and FM deviation -s * 6400 Hz
+            let inst_freq_hz = offset_hz - (s * 6_400.0);
+            phases[c_idx] = (phases[c_idx] + two_pi * inst_freq_hz / sr).rem_euclid(two_pi);
+            sum_i += phases[c_idx].cos() * scale_per_carrier;
+            sum_q += phases[c_idx].sin() * scale_per_carrier;
+        }
+
+        let i_val = sum_i.round().clamp(-32767.0, 32767.0) as i16;
+        let q_val = sum_q.round().clamp(-32767.0, 32767.0) as i16;
         frame.extend_from_slice(&i_val.to_le_bytes());
         frame.extend_from_slice(&q_val.to_le_bytes());
     }

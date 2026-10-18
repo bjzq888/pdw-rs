@@ -1,5 +1,6 @@
 //! Exact Port of `Flex.cpp` (`frame_flex`, `showblock`, `showframe`) for 2-FSK & 4-FSK FLEX
-//! (1600 / 3200 / 6400 bps, Phases A, B, C, D) + ReFLEX.
+//! (1600 / 3200 / 6400 bps, Phases A, B, C, D) + ReFLEX, with Multi-Fragment Reassembly
+//! and FLEX Groupcall Temporary Address (`2029568–2029583`) Tracking.
 //!
 //! Directly matches `Flex.cpp` and `sound_in.cpp` timing:
 //! - `flex_bc` counts down from `89` (`88` on Sync-1 bit, `71..=40` for FIW, `39` for FIW decode
@@ -37,6 +38,24 @@ const VTYPE_NAMES: [&str; 8] = [
 const NUMERIC_TABLE: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '*', 'U', ' ', '-', ']', '[',
 ];
+
+/// Tracks an in-progress multi-fragment FLEX message across consecutive frames.
+#[derive(Clone, Debug)]
+pub struct PendingFlexFragment {
+    pub capcode: String,
+    pub capcode_num: i64,
+    pub mode: String,
+    pub msg_type: String,
+    pub bitrate: u32,
+    pub text: String,
+    pub has_bit_errors: bool,
+    pub soft_recovered_words: usize,
+    pub fragment_count: usize,
+    pub last_fragment_num: u8,
+    pub started_with_frag3: bool,
+    pub frames_elapsed: usize,
+    pub group_members: Vec<u64>,
+}
 
 #[derive(Clone, Debug)]
 pub struct FlexPhaseBuffer {
@@ -153,6 +172,7 @@ pub struct FlexDecoder {
 
     group_frame: [i16; 16],
     group_capcodes: [Vec<u64>; 16],
+    pub pending_fragments: Vec<PendingFlexFragment>,
 }
 
 impl FlexDecoder {
@@ -187,6 +207,7 @@ impl FlexDecoder {
             phase_d: FlexPhaseBuffer::new('D'),
             group_frame: [-1; 16],
             group_capcodes: std::array::from_fn(|_| Vec::new()),
+            pending_fragments: Vec::new(),
         }
     }
 
@@ -225,6 +246,35 @@ impl FlexDecoder {
         self.hbit = 0;
         self.g_sps = 1600;
         self.g_sps2 = 1600;
+        self.pending_fragments.clear();
+    }
+
+    /// Flush any pending multi-fragment messages that have waited longer than `max_frames`
+    /// without receiving their final continuation fragment.
+    pub fn flush_expired_fragments(&mut self, max_frames: usize, convert_si: bool, out: &mut Vec<DecodedPagerMessage>) {
+        let now = chrono::Local::now();
+        let time_str = now.format("%H:%M:%S").to_string();
+        let date_str = now.format("%d-%m-%y").to_string();
+        let mut idx = 0;
+        while idx < self.pending_fragments.len() {
+            self.pending_fragments[idx].frames_elapsed += 1;
+            if self.pending_fragments[idx].frames_elapsed > max_frames {
+                let p = self.pending_fragments.remove(idx);
+                Self::emit_completed_fragment(p, &time_str, &date_str, true, convert_si, out);
+            } else {
+                idx += 1;
+            }
+        }
+    }
+
+    /// Force-flush all currently buffered multi-fragment messages immediately.
+    pub fn flush_all_pending_fragments(&mut self, convert_si: bool, out: &mut Vec<DecodedPagerMessage>) {
+        let now = chrono::Local::now();
+        let time_str = now.format("%H:%M:%S").to_string();
+        let date_str = now.format("%d-%m-%y").to_string();
+        for p in self.pending_fragments.drain(..) {
+            Self::emit_completed_fragment(p, &time_str, &date_str, true, convert_si, out);
+        }
     }
 
     /// Tick sample-rate timer (`sound_in.cpp:271–286`: `flex_timer` 2-second timeout).
@@ -246,10 +296,6 @@ impl FlexDecoder {
     pub fn slice_symbol(&mut self, val_128: f32, atb_bit: u8) -> (u8, f32, f32) {
         let abs_v = val_128.abs();
         if self.flex_blk == 0 {
-            // During Sync-1, FIW, and Sync-2, FLEX transmits 2-FSK at outer deviation (`±4.8 kHz`).
-            // Track positive and negative outer levels ONLY once Sync-1 is locked (`self.flex_bc > 0`),
-            // so dead-air noise spikes never corrupt `header_outer_level` and any residual DC offset
-            // is measured independently of FIW bit-balance!
             if self.flex_bc > 0 && abs_v > 8.0 {
                 self.header_outer_level = 0.90 * self.header_outer_level + 0.10 * abs_v;
                 self.header_level_sum += abs_v;
@@ -278,8 +324,6 @@ impl FlexDecoder {
                 (0.0, self.header_outer_level.max(12.0))
             };
             let adj_abs = (val_128 - header_dc).abs();
-            // At 3200 sps (FLEX-6400), post-discriminator filtering slightly rounds single-symbol outer peaks,
-            // so 0.56 * outer_ref centers the threshold in the 3200-sps 4-FSK eye (0.60 * outer_ref at 1600 sps).
             let thresh_ratio = if self.g_sps == 3200 { 0.56 } else { 0.60 };
             let inner_thresh = thresh_ratio * outer_ref;
             let gin = if atb_bit != 0 {
@@ -318,7 +362,6 @@ impl FlexDecoder {
         convert_si: bool,
         out: &mut Vec<DecodedPagerMessage>,
     ) {
-        // Update 64-bit sync register (`Flex.cpp:844–851`)
         for i in 0..3 {
             self.slr[i] = (self.slr[i] << 1) | ((self.slr[i + 1] >> 15) & 1);
         }
@@ -336,8 +379,6 @@ impl FlexDecoder {
             let mut nh =
                 (self.slr[1] ^ SYNC1).count_ones() + (self.slr[2] ^ SYNC2).count_ones();
 
-            // Inverted Sync-1 detection (`Flex.cpp:875–885`), guarded so we ONLY invert receive
-            // polarity if `(!slr[0], !slr[3])` also matches a valid `FLEX_SYNCS` entry!
             if nh >= 31 && ((self.slr[0] ^ self.slr[3]) ^ 0xFFFF).count_ones() < 2 {
                 let inv0 = !self.slr[0];
                 let inv3 = !self.slr[3];
@@ -408,8 +449,6 @@ impl FlexDecoder {
                 }
             }
 
-            // Note:Just like `Flex.cpp:1049`, this `if self.flex_bc > 0` runs on the SAME bit
-            // where `self.flex_bc = 89` was set, decrementing `flex_bc` to `88` on the Sync-1 bit!
             if self.flex_bc > 0 {
                 self.flex_bc -= 1;
 
@@ -463,7 +502,6 @@ impl FlexDecoder {
                 }
             }
         } else {
-            // Collect 11 interleaved data blocks (`Flex.cpp:1140–1236`)
             if self.g_sps == 1600 {
                 self.phase_a.block_bits[self.bct] = if gin < 2 { 1 } else { 0 };
                 self.phase_a.block_conf[self.bct] = conf_msb;
@@ -513,10 +551,13 @@ impl FlexDecoder {
                 }
 
                 if blknum == 10 && !self.reflex {
+                    self.flush_expired_fragments(8, convert_si, out);
+
                     Self::parse_phase_frame(
                         &self.phase_a,
                         &mut self.group_frame,
                         &mut self.group_capcodes,
+                        &mut self.pending_fragments,
                         self.current_frame,
                         self.speed_bps,
                         bch,
@@ -532,6 +573,7 @@ impl FlexDecoder {
                             &self.phase_b,
                             &mut self.group_frame,
                             &mut self.group_capcodes,
+                            &mut self.pending_fragments,
                             self.current_frame,
                             self.speed_bps,
                             bch,
@@ -547,6 +589,7 @@ impl FlexDecoder {
                             &self.phase_c,
                             &mut self.group_frame,
                             &mut self.group_capcodes,
+                            &mut self.pending_fragments,
                             self.current_frame,
                             self.speed_bps,
                             bch,
@@ -561,6 +604,7 @@ impl FlexDecoder {
                                 &self.phase_d,
                                 &mut self.group_frame,
                                 &mut self.group_capcodes,
+                                &mut self.pending_fragments,
                                 self.current_frame,
                                 self.speed_bps,
                                 bch,
@@ -584,8 +628,6 @@ impl FlexDecoder {
         }
     }
 
-    /// Try 5-bit Chase-2 soft-decision recovery on a FLEX BIW (`frame[0]`) or Vector word (`frame[vb]`),
-    /// enforcing the 4-bit hardware checksum (`Self::xsumchk`) inside the Chase-2 search loop.
     fn try_soft_xsum_word(
         phase: &FlexPhaseBuffer,
         k: usize,
@@ -645,7 +687,7 @@ impl FlexDecoder {
 
     #[inline]
     fn is_valid_flex_alpha_char(c: u8) -> bool {
-        c == 0x03 || c == b'\n' || c == b'\r' || (32..=126).contains(&c)
+        c == 0x03 || c == 0x7f || c == b'\n' || c == b'\r' || (32..=126).contains(&c)
     }
 
     #[inline]
@@ -661,7 +703,6 @@ impl FlexDecoder {
             && Self::is_valid_flex_alpha_char(c2)
     }
 
-    /// Try 5-bit Chase-2 soft-decision recovery on a corrupted FLEX header/control word (`k < 88`).
     fn try_soft_raw_word(
         phase: &FlexPhaseBuffer,
         k: usize,
@@ -681,9 +722,6 @@ impl FlexDecoder {
         Some(Self::bits_to_flex_word(&soft.bits[0..21].try_into().ok()?))
     }
 
-    /// Try guarded 5-bit Chase-2 soft-decision recovery on an Alpha message word (`k >= w1`).
-    /// Filters candidate codewords inside the Chase-2 search loop so all extracted 7-bit character
-    /// slots (`c1`, `c2`, and `c0` when `!skip_c0`) are guaranteed printable ASCII (`32..=126` or `0x03`).
     fn try_soft_alpha_word(
         phase: &FlexPhaseBuffer,
         k: usize,
@@ -717,6 +755,73 @@ impl FlexDecoder {
         }
     }
 
+    fn emit_completed_fragment(
+        p: PendingFlexFragment,
+        time_str: &str,
+        date_str: &str,
+        incomplete: bool,
+        convert_si: bool,
+        out: &mut Vec<DecodedPagerMessage>,
+    ) {
+        let frag_info = if p.fragment_count > 1 {
+            if incomplete {
+                Some(format!("{} frags (partial)", p.fragment_count))
+            } else {
+                Some(format!("{} frags", p.fragment_count))
+            }
+        } else if incomplete {
+            Some("1 frag (partial)".to_string())
+        } else {
+            None
+        };
+
+        let is_group_addr = (2_029_568..=2_029_583).contains(&p.capcode_num);
+        if convert_si && is_group_addr && !p.group_members.is_empty() {
+            let group_addr_str = format!("{:07}", p.capcode_num);
+            for &member in &p.group_members {
+                out.push(DecodedPagerMessage {
+                    capcode: format!("{:07}", member),
+                    time: time_str.to_string(),
+                    date: date_str.to_string(),
+                    mode: p.mode.clone(),
+                    msg_type: "GROUP".to_string(),
+                    bitrate: p.bitrate,
+                    message: p.text.clone(),
+                    has_bit_errors: p.has_bit_errors,
+                    soft_recovered_words: p.soft_recovered_words,
+                    filter_label: None,
+                    filter_color_idx: None,
+                    freq_hz: None,
+                    group_address: Some(group_addr_str.clone()),
+                    fragment_info: frag_info.clone(),
+                });
+            }
+        }
+
+        let leader_group_attr = if is_group_addr {
+            Some(format!("{:07}", p.capcode_num))
+        } else {
+            None
+        };
+
+        out.push(DecodedPagerMessage {
+            capcode: p.capcode,
+            time: time_str.to_string(),
+            date: date_str.to_string(),
+            mode: p.mode,
+            msg_type: p.msg_type,
+            bitrate: p.bitrate,
+            message: p.text,
+            has_bit_errors: p.has_bit_errors,
+            soft_recovered_words: p.soft_recovered_words,
+            filter_label: None,
+            filter_color_idx: None,
+            freq_hz: None,
+            group_address: leader_group_attr,
+            fragment_info: frag_info,
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn parse_phase_frame_for_test(
         phase_buf: &FlexPhaseBuffer,
@@ -731,10 +836,43 @@ impl FlexDecoder {
         convert_si: bool,
         out: &mut Vec<DecodedPagerMessage>,
     ) {
+        let mut pending = Vec::new();
         Self::parse_phase_frame(
             phase_buf,
             group_frame,
             group_capcodes,
+            &mut pending,
+            current_frame,
+            speed_bps,
+            bch,
+            qual,
+            show_tone,
+            show_numeric,
+            convert_si,
+            out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse_phase_frame_with_pending(
+        phase_buf: &FlexPhaseBuffer,
+        group_frame: &mut [i16; 16],
+        group_capcodes: &mut [Vec<u64>; 16],
+        pending_fragments: &mut Vec<PendingFlexFragment>,
+        current_frame: u8,
+        speed_bps: u32,
+        bch: &BchDecoder,
+        qual: &mut RxQualityTracker,
+        show_tone: bool,
+        show_numeric: bool,
+        convert_si: bool,
+        out: &mut Vec<DecodedPagerMessage>,
+    ) {
+        Self::parse_phase_frame(
+            phase_buf,
+            group_frame,
+            group_capcodes,
+            pending_fragments,
             current_frame,
             speed_bps,
             bch,
@@ -751,6 +889,7 @@ impl FlexDecoder {
         phase_buf: &FlexPhaseBuffer,
         group_frame: &mut [i16; 16],
         group_capcodes: &mut [Vec<u64>; 16],
+        pending_fragments: &mut Vec<PendingFlexFragment>,
         current_frame: u8,
         speed_bps: u32,
         bch: &BchDecoder,
@@ -797,9 +936,7 @@ impl FlexDecoder {
         let date_str = now.format("%d-%m-%y").to_string();
         let mode_str = format!("FLEX-{}", phase_buf.phase_char);
 
-        // Pass 1: Register all `MODE_SHORT_INSTRUCTION` (`vt == 1`) groupcall assignments first,
-        // so group messages on Priority Addresses (`2029568..2029583`) at `j = asa` in the same frame
-        // always have their member capcodes ready.
+        // Pass 1: Register all `MODE_SHORT_INSTRUCTION` (`vt == 1`) groupcall assignments first
         let mut j = asa;
         while j < vsa {
             let cc2 = frame[j] & 0x1f_ffff;
@@ -836,7 +973,7 @@ impl FlexDecoder {
             j += if is_long { 2 } else { 1 };
         }
 
-        // Pass 2: Decode and emit all messages (`Flex.cpp:411–710`)
+        // Pass 2: Decode and emit/reassemble all messages (`Flex.cpp:411–710`)
         let mut j = asa;
         while j < vsa {
             let cc2 = frame[j] & 0x1f_ffff;
@@ -844,7 +981,6 @@ impl FlexDecoder {
                 cc2 < 0x00_8001 || (cc2 > 0x1e_0000 && cc2 < 0x1f_0001) || cc2 > 0x1f_7ffe;
 
             let vb = vsa + j - asa;
-            // Match `Flex.cpp:423–425`: if `xsumchk(frame[vb])` fails, increment `j` by 1 (`j++`), NOT 2!
             if vb >= 88 || !Self::xsumchk(frame[vb]) {
                 qual.record_word(1, false);
                 j += 1;
@@ -869,10 +1005,10 @@ impl FlexDecoder {
                         j += if is_long { 2 } else { 1 };
                         continue;
                     }
-                    let mut w2 = (w1 + len - 1).min(87);
+                    let w2 = (w1 + len - 1).min(87);
 
                     let mut soft_cnt = 0usize;
-                    let fragment_num = if !is_long {
+                    let (fragment_num, continued_flag) = if !is_long {
                         let mut hdr_w = frame[w1];
                         if hdr_w > 0x3f_ffff {
                             if let Some(rec_hdr) = Self::try_soft_raw_word(phase_buf, w1, bch, qual) {
@@ -880,13 +1016,13 @@ impl FlexDecoder {
                                 soft_cnt += 1;
                             }
                         }
-                        let f = if hdr_w <= 0x3f_ffff {
-                            ((hdr_w >> 11) & 0x03) as u8
+                        let (f, c) = if hdr_w <= 0x3f_ffff {
+                            (((hdr_w >> 11) & 0x03) as u8, ((hdr_w >> 10) & 0x01) != 0)
                         } else {
-                            3
+                            (3, false)
                         };
                         w1 += 1;
-                        f
+                        (f, c)
                     } else {
                         let mut hdr_w = frame[vb + 1];
                         if hdr_w > 0x3f_ffff {
@@ -895,15 +1031,11 @@ impl FlexDecoder {
                                 soft_cnt += 1;
                             }
                         }
-                        // Note: `w2` is already initialized as `(w1 + len - 1).min(87)` (inclusive).
-                        // For 9-digit long addresses (`is_long`), the header word lives in `frame[vb + 1]`
-                        // rather than `frame[w1]`, so all `len` words `w1..=w2` are character words!
-                        let f = if hdr_w <= 0x3f_ffff {
-                            ((hdr_w >> 11) & 0x03) as u8
+                        if hdr_w <= 0x3f_ffff {
+                            (((hdr_w >> 11) & 0x03) as u8, ((hdr_w >> 10) & 0x01) != 0)
                         } else {
-                            3
-                        };
-                        f
+                            (3, false)
+                        }
                     };
 
                     let mut msg_text = String::new();
@@ -932,8 +1064,6 @@ impl FlexDecoder {
                             }
                         }
 
-                        // If the codeword is still uncorrectable after 5-bit Chase-2 soft BCH,
-                        // emit clean '?' placeholders instead of unpacking 21 random corrupted bits.
                         if word_val > 0x3f_ffff {
                             if !skip_c0 {
                                 msg_text.push('?');
@@ -943,13 +1073,12 @@ impl FlexDecoder {
                             continue;
                         }
 
-                        // Valid codeword: unpack 7-bit ASCII characters and stop immediately on ETX (0x03)
                         let push_flex_char = |s: &mut String, c: u8| -> bool {
                             if c == 0x03 {
                                 return true; // ETX (End of Text)
                             }
-                            if c == 0 {
-                                // NULL padding
+                            if c == 0 || c == 0x7f {
+                                // NULL or 0x7F signature filler
                             } else if c == b'\n' || c == b'\r' {
                                 s.push(' ');
                             } else if (32..=126).contains(&c) {
@@ -977,50 +1106,130 @@ impl FlexDecoder {
                         }
                     }
 
+                    // Capture any assigned group members if this is a groupcall address (2029568..=2029583)
+                    let mut group_members = Vec::new();
                     if convert_si && (2_029_568..=2_029_583).contains(&capcode_num) {
                         let gbit = (capcode_num - 2_029_568) as usize;
                         if group_frame[gbit] == current_frame as i16 {
-                            let mut members = group_capcodes[gbit].clone();
-                            members.sort_unstable();
-                            for member in members {
-                                out.push(DecodedPagerMessage {
-                                    capcode: format!("{:07}", member),
-                                    time: time_str.clone(),
-                                    date: date_str.clone(),
-                                    mode: mode_str.clone(),
-                                    msg_type: "GROUP".to_string(),
-                                    bitrate: speed_bps,
-                                    message: msg_text.clone(),
-                                    has_bit_errors: has_err,
-                                    soft_recovered_words: soft_cnt,
-                                    filter_label: None,
-                                    filter_color_idx: None,
-                                });
-                            }
+                            group_members = group_capcodes[gbit].clone();
+                            group_members.sort_unstable();
                             group_capcodes[gbit].clear();
                             group_frame[gbit] = -1;
                         }
                     }
 
-                    out.push(DecodedPagerMessage {
-                        capcode: capcode_str,
-                        time: time_str.clone(),
-                        date: date_str.clone(),
-                        mode: mode_str.clone(),
-                        msg_type: VTYPE_NAMES[vt].to_string(),
-                        bitrate: speed_bps,
-                        message: msg_text,
-                        has_bit_errors: has_err,
-                        soft_recovered_words: soft_cnt,
-                        filter_label: None,
-                        filter_color_idx: None,
-                    });
+                    // Multi-Fragment FLEX Reassembly State Machine
+                    let existing_pos = pending_fragments
+                        .iter()
+                        .position(|p| p.capcode == capcode_str);
+
+                    if let Some(pos) = existing_pos {
+                        let restart_needed =
+                            fragment_num == 3 && pending_fragments[pos].started_with_frag3;
+                        if restart_needed {
+                            let old_p = pending_fragments.remove(pos);
+                            Self::emit_completed_fragment(
+                                old_p,
+                                &time_str,
+                                &date_str,
+                                true,
+                                convert_si,
+                                out,
+                            );
+                            let new_p = PendingFlexFragment {
+                                capcode: capcode_str,
+                                capcode_num,
+                                mode: mode_str.clone(),
+                                msg_type: VTYPE_NAMES[vt].to_string(),
+                                bitrate: speed_bps,
+                                text: msg_text,
+                                has_bit_errors: has_err,
+                                soft_recovered_words: soft_cnt,
+                                fragment_count: 1,
+                                last_fragment_num: fragment_num,
+                                started_with_frag3: true,
+                                frames_elapsed: 0,
+                                group_members,
+                            };
+                            if continued_flag {
+                                pending_fragments.push(new_p);
+                            } else {
+                                Self::emit_completed_fragment(
+                                    new_p,
+                                    &time_str,
+                                    &date_str,
+                                    false,
+                                    convert_si,
+                                    out,
+                                );
+                            }
+                        } else {
+                            let p = &mut pending_fragments[pos];
+                            p.text.push_str(&msg_text);
+                            p.has_bit_errors |= has_err;
+                            p.soft_recovered_words += soft_cnt;
+                            p.fragment_count += 1;
+                            p.last_fragment_num = fragment_num;
+                            p.frames_elapsed = 0;
+                            for m in group_members {
+                                if !p.group_members.contains(&m) {
+                                    p.group_members.push(m);
+                                }
+                            }
+                            let is_complete = if p.started_with_frag3 {
+                                !continued_flag
+                            } else {
+                                fragment_num == 3 && !continued_flag
+                            };
+                            if is_complete {
+                                let completed = pending_fragments.remove(pos);
+                                Self::emit_completed_fragment(
+                                    completed,
+                                    &time_str,
+                                    &date_str,
+                                    false,
+                                    convert_si,
+                                    out,
+                                );
+                            }
+                        }
+                    } else {
+                        let new_p = PendingFlexFragment {
+                            capcode: capcode_str,
+                            capcode_num,
+                            mode: mode_str.clone(),
+                            msg_type: VTYPE_NAMES[vt].to_string(),
+                            bitrate: speed_bps,
+                            text: msg_text,
+                            has_bit_errors: has_err,
+                            soft_recovered_words: soft_cnt,
+                            fragment_count: 1,
+                            last_fragment_num: fragment_num,
+                            started_with_frag3: fragment_num == 3,
+                            frames_elapsed: 0,
+                            group_members,
+                        };
+                        let is_multipart_start = continued_flag || fragment_num < 3;
+                        if is_multipart_start {
+                            pending_fragments.push(new_p);
+                        } else {
+                            Self::emit_completed_fragment(
+                                new_p,
+                                &time_str,
+                                &date_str,
+                                false,
+                                convert_si,
+                                out,
+                            );
+                        }
+                    }
                 }
                 1 => {
                     // MODE_SHORT_INSTRUCTION (`Flex.cpp:508–540`)
                     if !(2_029_568..=2_029_583).contains(&capcode_num) && !convert_si {
                         let assigned_frame = ((frame[vb] >> 10) & 0x7f) as i16;
                         let temp_addr = ((frame[vb] >> 17) & 0x7f) as usize;
+                        let group_addr_str = format!("{:07}", 2_029_568 + temp_addr);
                         out.push(DecodedPagerMessage {
                             capcode: capcode_str,
                             time: time_str.clone(),
@@ -1029,14 +1238,16 @@ impl FlexDecoder {
                             msg_type: "INSTR".to_string(),
                             bitrate: speed_bps,
                             message: format!(
-                                "TEMPORARY ADDRESS: {:07} -> FRAME {:03}",
-                                2_029_568 + temp_addr,
-                                assigned_frame
+                                "TEMPORARY ADDRESS: {} -> FRAME {:03}",
+                                group_addr_str, assigned_frame
                             ),
                             has_bit_errors: addr_err,
                             soft_recovered_words: 0,
                             filter_label: None,
                             filter_color_idx: None,
+                            freq_hz: None,
+                            group_address: Some(group_addr_str),
+                            fragment_info: None,
                         });
                     }
                 }
@@ -1097,6 +1308,9 @@ impl FlexDecoder {
                             soft_recovered_words: soft_cnt,
                             filter_label: None,
                             filter_color_idx: None,
+                            freq_hz: None,
+                            group_address: None,
+                            fragment_info: None,
                         });
                     }
                 }
@@ -1132,6 +1346,9 @@ impl FlexDecoder {
                             soft_recovered_words: 0,
                             filter_label: None,
                             filter_color_idx: None,
+                            freq_hz: None,
+                            group_address: None,
+                            fragment_info: None,
                         });
                     }
                 }
@@ -1189,6 +1406,9 @@ impl FlexDecoder {
                             soft_recovered_words: 0,
                             filter_label: None,
                             filter_color_idx: None,
+                            freq_hz: None,
+                            group_address: None,
+                            fragment_info: None,
                         });
                     }
                 }

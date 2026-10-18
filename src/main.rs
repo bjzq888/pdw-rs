@@ -1,7 +1,9 @@
-//! `pdw-rs`: Modern Rust POCSAG & FLEX Paging Decoder with 48 kHz / 44.1 kHz Audio DSP, Local GUI & Live Web Server
+//! `pdw-rs`: Modern Rust POCSAG & FLEX Paging Decoder with Parallel Multi-Frequency SDRconnect IQ,
+//! Multi-Fragment FLEX Reassembly, Capcode Directory Catalog & Built-In Live Web Server.
 
 pub mod audio;
 pub mod bch;
+pub mod catalog;
 pub mod config;
 pub mod dsp;
 pub mod flex;
@@ -15,9 +17,9 @@ use gui::PdwApp;
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("PDW-RS v0.3.0 — POCSAG & FLEX (2/4-FSK) Decoder (Soundcard, SDRconnect IQ & Live Web Server)")
-            .with_inner_size([1120.0, 680.0])
-            .with_min_inner_size([720.0, 420.0]),
+            .with_title("PDW-RS v0.2.7 — POCSAG & FLEX (2/4-FSK) Decoder (Parallel Multi-Freq IQ, Capcode Catalog & Live Web Server)")
+            .with_inner_size([1160.0, 720.0])
+            .with_min_inner_size([760.0, 440.0]),
         ..Default::default()
     };
 
@@ -31,16 +33,22 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::audio::{
-        synthesize_flex_4fsk_burst, synthesize_flex_6400_4fsk_burst, synthesize_pocsag_burst,
+        build_flex_alpha_phase_words_frag, synthesize_flex_4fsk_burst,
+        synthesize_flex_6400_4fsk_burst, synthesize_pocsag_burst,
     };
     use crate::bch::BchDecoder;
-    use crate::config::AppConfig;
+    use crate::catalog::CapcodeCatalogDb;
+    use crate::config::{AppConfig, DEFAULT_PRIMARY_FREQ_HZ, DEFAULT_SECONDARY_FREQ_HZ};
     use crate::dsp::{AdaptiveEnvelopeTracker, AtbSlicer, RxQualityTracker};
-    use crate::flex::FlexDecoder;
+    use crate::flex::{FlexDecoder, FlexPhaseBuffer, PendingFlexFragment};
     use crate::gui::{process_audio_chunk, DspTelemetry};
     use crate::pocsag::{DecodedPagerMessage, PocsagChannelDecoder};
+    use crate::sdrconnect::{
+        synthesize_multi_channel_sdrconnect_iq_frame, MultiChannelIqDemodulator,
+    };
     use crossbeam_channel::bounded;
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     fn run_stream_in_wasapi_chunks(sample_rate: u32, samples: &[f32]) -> Vec<DecodedPagerMessage> {
@@ -58,7 +66,6 @@ mod tests {
         let mut sample_counter = 0usize;
         let telemetry = Arc::new(Mutex::new(DspTelemetry::default()));
 
-        // Feed in 441-sample (~10 ms WASAPI) chunks to test cross-chunk WatchCtr continuity
         for chunk in samples.chunks(441) {
             process_audio_chunk(
                 chunk,
@@ -89,15 +96,12 @@ mod tests {
     fn test_pocsag_512_1200_2400_and_inverted_polarity_at_44100_and_48000() {
         for &sr in &[44_100u32, 48_000u32] {
             let mut stream = Vec::new();
-            // Prepend ±0.974 noise + negative idle run to verify slicer immunity
             for i in 0..2000 {
                 stream.push(if i < 1000 { -0.974 } else { 0.974 });
             }
-            // 1. Short 2-word POCSAG-512 Alpha message ("HELLO")
             stream.extend(synthesize_pocsag_burst(sr, 512, 111_222, 4, "HELLO", 0.03));
             stream.extend(vec![0.0; (sr / 4) as usize]);
 
-            // 2. POCSAG-1200 Alpha message with inverted polarity
             let mut inv_1200 = synthesize_pocsag_burst(
                 sr,
                 1200,
@@ -112,7 +116,6 @@ mod tests {
             stream.extend(inv_1200);
             stream.extend(vec![0.0; (sr / 4) as usize]);
 
-            // 3. POCSAG-2400 Alpha message (normal polarity — verifies automatic polarity flip back!)
             stream.extend(synthesize_pocsag_burst(
                 sr,
                 2400,
@@ -140,12 +143,10 @@ mod tests {
     fn test_flex_4fsk_3200_and_6400_all_phases_after_974_noise_at_44100_and_48000() {
         for &sr in &[44_100u32, 48_000u32] {
             let mut stream = Vec::new();
-            // Simulate ±0.974 live virtual-cable signal before the test burst (even if it mimics a 1200-baud POCSAG preamble!)
             for i in 0..4000 {
                 stream.push(if (i / 30) % 2 == 0 { 0.974 } else { -0.974 });
             }
 
-            // 1. FLEX-3200 4-FSK (1600 sps, Phases A+B) with 7-digit short capcodes (<= 2,029,567)
             stream.extend(synthesize_flex_4fsk_burst(
                 sr,
                 1_122_334,
@@ -156,7 +157,6 @@ mod tests {
             ));
             stream.extend(vec![-0.75; (sr / 5) as usize]);
 
-            // 2. FLEX-6400 4-FSK (3200 sps, Phases A+B+C+D across 1600->3200 crossover)
             stream.extend(synthesize_flex_6400_4fsk_burst(
                 sr,
                 1_000_001,
@@ -170,7 +170,6 @@ mod tests {
                 0.02,
             ));
 
-            // 3. Inverted FLEX-3200 4-FSK frame
             let mut inv_flex = synthesize_flex_4fsk_burst(
                 sr,
                 1_233_445,
@@ -315,6 +314,183 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_multi_frequency_decoding_929_61250_and_929_73862_mhz_and_2mhz_limit() {
+        let cfg = AppConfig::default();
+        let enabled = cfg.enabled_frequencies_hz();
+        assert_eq!(
+            enabled,
+            vec![DEFAULT_PRIMARY_FREQ_HZ, DEFAULT_SECONDARY_FREQ_HZ],
+            "Default config must monitor 929.61250 MHz and 929.73862 MHz in parallel"
+        );
+        assert!(
+            cfg.validate_frequency_within_2mhz(930_500_000, None).is_ok(),
+            "Frequency within 2 MHz span should be accepted"
+        );
+        assert!(
+            cfg.validate_frequency_within_2mhz(932_000_000, None).is_err(),
+            "Frequency > 2 MHz away from 929.61250 MHz should be rejected"
+        );
+
+        // Synthesize a 384 kHz wideband IQ stream containing simultaneous paging bursts on:
+        // - Channel 1: 929.61250 MHz (offset 0 Hz from 929.61250 MHz reference)
+        // - Channel 2: 929.73862 MHz (offset +126,120 Hz from 929.61250 MHz reference)
+        let baseband_sr = 48_000u32;
+        let iq_sr = 384_000u32;
+        let mut ch1_baseband = vec![0.0f32; 2400];
+        ch1_baseband.extend(synthesize_pocsag_burst(
+            baseband_sr,
+            1200,
+            1_234_567,
+            4,
+            "CH1 929.61250 MHZ PARALLEL DECODE OK",
+            0.005,
+        ));
+        ch1_baseband.extend(vec![0.0f32; 2400]);
+
+        let mut ch2_baseband = vec![0.0f32; 2400];
+        ch2_baseband.extend(synthesize_flex_4fsk_burst(
+            baseband_sr,
+            1_122_334,
+            "CH2 929.73862 MHZ FLEX A OK",
+            1_556_677,
+            "CH2 929.73862 MHZ FLEX B OK",
+            0.005,
+        ));
+        ch2_baseband.extend(vec![0.0f32; 2400]);
+
+        let offset_ch2 = (DEFAULT_SECONDARY_FREQ_HZ - DEFAULT_PRIMARY_FREQ_HZ) as f64; // +126,120 Hz
+        let composite_iq = synthesize_multi_channel_sdrconnect_iq_frame(
+            &[(0.0, &ch1_baseband), (offset_ch2, &ch2_baseband)],
+            iq_sr,
+            baseband_sr,
+        );
+
+        let mut multi_demod = MultiChannelIqDemodulator::new(
+            &[DEFAULT_PRIMARY_FREQ_HZ, DEFAULT_SECONDARY_FREQ_HZ],
+            DEFAULT_PRIMARY_FREQ_HZ,
+            iq_sr,
+            baseband_sr,
+            1.0,
+            false,
+            -85.0,
+            true,
+            20_000.0,
+        );
+
+        let chunks = multi_demod.process_binary_frame(&composite_iq);
+        assert_eq!(chunks.len(), 2);
+
+        let msgs_ch1 = run_stream_in_wasapi_chunks(baseband_sr, &chunks[0].samples);
+        let msgs_ch2 = run_stream_in_wasapi_chunks(baseband_sr, &chunks[1].samples);
+
+        assert_eq!(msgs_ch1.len(), 1);
+        assert_eq!(msgs_ch1[0].capcode, "1234567");
+        assert_eq!(msgs_ch1[0].message, "CH1 929.61250 MHZ PARALLEL DECODE OK");
+
+        assert_eq!(msgs_ch2.len(), 2);
+        assert_eq!(msgs_ch2[0].capcode, "1122334");
+        assert_eq!(msgs_ch2[0].message, "CH2 929.73862 MHZ FLEX A OK");
+        assert_eq!(msgs_ch2[1].capcode, "1556677");
+        assert_eq!(msgs_ch2[1].message, "CH2 929.73862 MHZ FLEX B OK");
+    }
+
+    #[test]
+    fn test_multi_fragment_flex_reassembly_and_capcode_catalog_db() {
+        let bch = BchDecoder::new();
+        let mut qual = RxQualityTracker::new();
+        let mut group_frame = [-1i16; 16];
+        let mut group_capcodes: [Vec<u64>; 16] = std::array::from_fn(|_| Vec::new());
+        let mut pending: Vec<PendingFlexFragment> = Vec::new();
+        let mut out: Vec<DecodedPagerMessage> = Vec::new();
+
+        // Build Frame 1: Fragment 1 (fragment_num = 3, continued = true)
+        let words_f1 = build_flex_alpha_phase_words_frag(
+            1_445_566,
+            "PART 1 OF LONG HOSPITAL DISPATCH - ",
+            3,
+            true,
+        );
+        let mut phase_f1 = FlexPhaseBuffer::new('A');
+        phase_f1.frame_words = words_f1;
+
+        FlexDecoder::parse_phase_frame_with_pending(
+            &phase_f1,
+            &mut group_frame,
+            &mut group_capcodes,
+            &mut pending,
+            10,
+            3200,
+            &bch,
+            &mut qual,
+            true,
+            true,
+            true,
+            &mut out,
+        );
+        assert!(
+            out.is_empty(),
+            "First fragment with continued=true should be buffered, not emitted prematurely"
+        );
+        assert_eq!(pending.len(), 1);
+
+        // Build Frame 2: Fragment 2 (fragment_num = 0, continued = false)
+        let words_f2 = build_flex_alpha_phase_words_frag(
+            1_445_566,
+            "PART 2 COMPLETED REASSEMBLY OK",
+            0,
+            false,
+        );
+        let mut phase_f2 = FlexPhaseBuffer::new('A');
+        phase_f2.frame_words = words_f2;
+
+        FlexDecoder::parse_phase_frame_with_pending(
+            &phase_f2,
+            &mut group_frame,
+            &mut group_capcodes,
+            &mut pending,
+            11,
+            3200,
+            &bch,
+            &mut qual,
+            true,
+            true,
+            true,
+            &mut out,
+        );
+        assert!(pending.is_empty());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].capcode, "1445566");
+        assert_eq!(
+            out[0].message,
+            "PART 1 OF LONG HOSPITAL DISPATCH - PART 2 COMPLETED REASSEMBLY OK"
+        );
+        assert_eq!(out[0].fragment_info.as_deref(), Some("2 frags"));
+
+        // Verify CapcodeCatalogDb tracking, groupcall recording, deletion, and clear
+        let tmp_db_path = PathBuf::from("test_unit_capcode_db.dat");
+        let _ = std::fs::remove_file(&tmp_db_path);
+        let mut db = CapcodeCatalogDb::new(tmp_db_path.clone());
+        let mut m = out[0].clone();
+        m.freq_hz = Some(DEFAULT_SECONDARY_FREQ_HZ);
+        m.group_address = Some("2029568".to_string());
+        db.record_message(&m);
+        db.save_to_disk().expect("Should save catalog DB to disk");
+
+        let mut db_reloaded = CapcodeCatalogDb::load_or_default(&tmp_db_path);
+        assert_eq!(db_reloaded.total_capcodes(), 1);
+        let prof = db_reloaded.profiles.get("1445566").expect("Profile must exist");
+        assert_eq!(prof.message_count, 1);
+        assert_eq!(prof.seen_bitrates, vec![3200]);
+        assert_eq!(prof.frequencies_hz, vec![DEFAULT_SECONDARY_FREQ_HZ]);
+        assert_eq!(prof.flex_group_addresses, vec!["2029568".to_string()]);
+        assert_eq!(prof.messages.len(), 1);
+
+        assert!(db_reloaded.remove_capcode("1445566"));
+        assert_eq!(db_reloaded.total_capcodes(), 0);
+        let _ = std::fs::remove_file(&tmp_db_path);
+    }
+
+    #[test]
     fn test_pdw_holdover_fixes_long_capcode_biw_soft_recovery_and_numeric_bounds() {
         use crate::dsp::RxQualityTracker;
         use crate::flex::{FlexDecoder, FlexPhaseBuffer};
@@ -323,7 +499,6 @@ mod tests {
         let mut qual = RxQualityTracker::new();
         let mut phase = FlexPhaseBuffer::new('A');
 
-        // Helper to encode a 21-bit FLEX word into `phase` at `word_idx`, optionally injecting weak bit errors
         let encode_flex_word = |phase: &mut FlexPhaseBuffer,
                                 word_idx: usize,
                                 w: u32,

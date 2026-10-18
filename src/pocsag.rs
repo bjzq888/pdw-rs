@@ -29,7 +29,8 @@ pub enum PocsagMsgType {
     Both,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DecodedPagerMessage {
     pub capcode: String,
     pub time: String,
@@ -42,6 +43,21 @@ pub struct DecodedPagerMessage {
     pub soft_recovered_words: usize,
     pub filter_label: Option<String>,
     pub filter_color_idx: Option<usize>,
+    /// Optional RF carrier frequency in Hz (e.g. `Some(929_612_500)` or `Some(929_738_620)`)
+    pub freq_hz: Option<u64>,
+    /// Optional FLEX groupcall temporary address (`"2029568"`..=`"2029583"`) associated with this message
+    pub group_address: Option<String>,
+    /// Optional multi-fragment reassembly indicator (e.g. `Some("2 frags")`)
+    pub fragment_info: Option<String>,
+}
+
+impl DecodedPagerMessage {
+    pub fn freq_mhz_str(&self) -> String {
+        match self.freq_hz {
+            Some(hz) if hz > 0 => format!("{:.5}", (hz as f64) / 1_000_000.0),
+            _ => String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -396,6 +412,9 @@ impl PocsagChannelDecoder {
                     soft_recovered_words: self.soft_words_in_msg,
                     filter_label: None,
                     filter_color_idx: None,
+                    freq_hz: None,
+                    group_address: None,
+                    fragment_info: None,
                 });
             }
         }
@@ -417,6 +436,9 @@ impl PocsagChannelDecoder {
                     soft_recovered_words: self.soft_words_in_msg,
                     filter_label: None,
                     filter_color_idx: None,
+                    freq_hz: None,
+                    group_address: None,
+                    fragment_info: None,
                 });
             } else if msg_type != PocsagMsgType::ToneOnly && show_numeric {
                 let text: String = self.num_chars.iter().collect();
@@ -433,6 +455,9 @@ impl PocsagChannelDecoder {
                     soft_recovered_words: self.soft_words_in_msg,
                     filter_label: None,
                     filter_color_idx: None,
+                    freq_hz: None,
+                    group_address: None,
+                    fragment_info: None,
                 });
             }
         }

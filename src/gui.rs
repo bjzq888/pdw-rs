@@ -1,21 +1,24 @@
 //! Local Desktop GUI (`eframe` / `egui`) for `pdw-rs`
 //!
-//! Optimized for ultra-low CPU usage (< 1% CPU on software `opengl32.dll` / Mesa rasterizers):
-//! - Event-driven GUI repainting: wakes immediately when a message is decoded, and otherwise
-//!   repaints only once per second (1 FPS) when the live oscilloscope is toggled off.
-//! - Toggleable `Scope` checkbox directly on the top toolbar (off by default to save CPU).
-//! - Built-in live HTTP/SSE Web Server (`web.rs`, default port `8008`) with runtime toggle and port configuration.
-//! - Idle-gated POCSAG bit clock: skips POCSAG symbol clock division when `pocbit == 0`.
-//! - Throttled telemetry mutex updates (~10 Hz instead of 100 Hz).
+//! Features:
+//! - Event-driven low-CPU GUI repainting (< 1% idle CPU).
+//! - Parallel Multi-Frequency SDRconnect IQ monitoring (`<= 2.0 MHz` receiver bandwidth span,
+//!   defaulting to `929.61250 MHz` and `929.73862 MHz`) with isolated per-frequency DSP pipelines.
+//! - Multi-fragment FLEX alphanumeric/secure message reassembly.
+//! - Persistent Capcode Directory & Message Catalog Database (`pdw_capcode_db.dat`) with
+//!   first/last seen, message counts, baud rates, frequencies, and FLEX groupcall tracking.
+//! - Built-in live HTTP/SSE Web Server (`web.rs`, default port `8008`) with browser caching.
 
 use crate::audio::{
     list_input_devices, start_audio_capture, synthesize_flex_4fsk_burst, synthesize_pocsag_burst,
     AudioCaptureStream,
 };
 use crate::bch::BchDecoder;
+use crate::catalog::{CapcodeCatalogDb, DEFAULT_CATALOG_DB_FILENAME};
 use crate::config::{
-    is_human_readable_message, AppConfig, DuplicateBlocker, FilterAction, FilterRule, FilterType, FilterVerdict,
-    InputSource, StatsTracker,
+    default_monitored_frequencies, is_human_readable_message, AppConfig, DuplicateBlocker,
+    FilterAction, FilterRule, FilterType, FilterVerdict, InputSource, MonitoredFrequency,
+    StatsTracker, DEFAULT_PRIMARY_FREQ_HZ,
 };
 use crate::dsp::{
     AdaptiveEnvelopeTracker, AtbSlicer, AudioPreset, RxQualityTracker, COURSE_CLKT_HI,
@@ -24,8 +27,8 @@ use crate::dsp::{
 use crate::flex::FlexDecoder;
 use crate::pocsag::{DecodedPagerMessage, PocsagChannelDecoder};
 use crate::sdrconnect::{
-    start_sdrconnect_iq_capture, synthesize_sdrconnect_iq_frame_from_baseband, IqFmDemodulator,
-    SdrConnectControlCmd, SdrConnectParams, SdrConnectStream,
+    start_sdrconnect_iq_capture, synthesize_sdrconnect_iq_frame_from_baseband, DemodAudioChunk,
+    IqFmDemodulator, SdrConnectControlCmd, SdrConnectParams, SdrConnectStream,
 };
 use crate::web::{
     WebServerHandle, WebServerSharedState, WebTelemetrySnapshot, WebUiCommand, DEFAULT_WEB_PORT,
@@ -82,12 +85,14 @@ pub enum WorkerCommand {
     UpdateConfig(AppConfig),
     ResetRxQuality,
     InjectSamples(Vec<f32>),
+    InjectChannelSamples(Option<u64>, Vec<f32>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortColumn {
     Arrival,
     Address,
+    Frequency,
     Mode,
     MsgType,
     Bitrate,
@@ -99,6 +104,7 @@ struct TableUiEvents {
     clicked_capcode: Option<String>,
     selected_msg: Option<DecodedPagerMessage>,
     add_filter_for_msg: Option<DecodedPagerMessage>,
+    open_catalog_for_capcode: Option<String>,
 }
 
 pub struct PdwApp {
@@ -109,12 +115,19 @@ pub struct PdwApp {
     audio_status: String,
     available_devices: Vec<String>,
     vfo_mhz_input: String,
+    new_freq_mhz_input: String,
+    new_freq_label_input: String,
+    freq_validation_error: String,
 
-    // Channels between audio thread, DSP worker thread, and GUI
+    // Channels between audio/SDR threads, DSP worker thread, and GUI
     sample_tx: Sender<Vec<f32>>,
+    sdr_chunk_tx: Sender<DemodAudioChunk>,
     cmd_tx: Sender<WorkerCommand>,
     msg_rx: Receiver<DecodedPagerMessage>,
     telemetry: Arc<Mutex<DspTelemetry>>,
+
+    // Persistent Capcode Directory & Message Catalog DB
+    catalog_db: Arc<Mutex<CapcodeCatalogDb>>,
 
     // Live Web Server state & handle
     web_state: Arc<WebServerSharedState>,
@@ -137,6 +150,12 @@ pub struct PdwApp {
     show_options: bool,
     show_filters: bool,
     show_stats: bool,
+    show_capcode_catalog: bool,
+
+    // Capcode Catalog UI state
+    catalog_search_query: String,
+    selected_catalog_capcode: Option<String>,
+    editing_catalog_alias: String,
 
     // Filter editor scratch state
     editing_filter: FilterRule,
@@ -147,13 +166,11 @@ pub struct PdwApp {
 
 impl PdwApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Force dark theme so white capcodes and cyan/red message colors are always high-contrast
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
         let config_path = PathBuf::from("pdw_config.toml");
         let mut config = AppConfig::load_or_default(&config_path);
 
-        // Auto-import legacy `filters.ini` / `FILTERS.INI` if present and filters list is empty
         for flt_name in ["filters.ini", "FILTERS.INI", "Filters.ini"] {
             let legacy_ini = PathBuf::from(flt_name);
             if config.filters.is_empty() && legacy_ini.exists() {
@@ -162,13 +179,18 @@ impl PdwApp {
             }
         }
 
+        let catalog_db = Arc::new(Mutex::new(CapcodeCatalogDb::load_or_default(
+            &PathBuf::from(DEFAULT_CATALOG_DB_FILENAME),
+        )));
+
         let (sample_tx, sample_rx) = bounded::<Vec<f32>>(256);
-        let (cmd_tx, cmd_rx) = bounded::<WorkerCommand>(32);
+        let (sdr_chunk_tx, sdr_chunk_rx) = bounded::<DemodAudioChunk>(512);
+        let (cmd_tx, cmd_rx) = bounded::<WorkerCommand>(64);
         let (msg_tx, msg_rx) = bounded::<DecodedPagerMessage>(1024);
         let telemetry = Arc::new(Mutex::new(DspTelemetry::default()));
-        let (web_state, web_cmd_rx) = WebServerSharedState::new(Some(cc.egui_ctx.clone()));
+        let (web_state, web_cmd_rx) =
+            WebServerSharedState::new(Arc::clone(&catalog_db), Some(cc.egui_ctx.clone()));
 
-        // Spawn dedicated real-time DSP & protocol decoder thread
         let telemetry_clone = Arc::clone(&telemetry);
         let initial_cfg = config.clone();
         let egui_ctx = Some(cc.egui_ctx.clone());
@@ -176,6 +198,7 @@ impl PdwApp {
             run_dsp_worker(
                 initial_cfg,
                 sample_rx,
+                sdr_chunk_rx,
                 cmd_rx,
                 msg_tx,
                 telemetry_clone,
@@ -184,7 +207,7 @@ impl PdwApp {
         });
 
         let available_devices = list_input_devices();
-        let vfo_mhz_input = format!("{:.4}", (config.sdrconnect_vfo_freq_hz as f64) / 1_000_000.0);
+        let vfo_mhz_input = format!("{:.5}", (config.sdrconnect_vfo_freq_hz as f64) / 1_000_000.0);
 
         let mut app = Self {
             config_path,
@@ -194,10 +217,15 @@ impl PdwApp {
             audio_status: String::new(),
             available_devices,
             vfo_mhz_input,
+            new_freq_mhz_input: String::new(),
+            new_freq_label_input: String::new(),
+            freq_validation_error: String::new(),
             sample_tx,
+            sdr_chunk_tx,
             cmd_tx,
             msg_rx,
             telemetry,
+            catalog_db,
             web_state,
             web_cmd_rx,
             web_server: None,
@@ -214,6 +242,10 @@ impl PdwApp {
             show_options: false,
             show_filters: false,
             show_stats: false,
+            show_capcode_catalog: false,
+            catalog_search_query: String::new(),
+            selected_catalog_capcode: None,
+            editing_catalog_alias: String::new(),
             editing_filter: FilterRule::default(),
             editing_filter_idx: None,
             filter_ini_path: "filters.ini".to_string(),
@@ -256,6 +288,22 @@ impl PdwApp {
         }
     }
 
+    fn sync_sdrconnect_frequencies(&mut self) {
+        self.config.enforce_2mhz_span_limit();
+        let enabled = self.config.enabled_frequencies_hz();
+        if let Some(&first_hz) = enabled.first() {
+            self.config.sdrconnect_vfo_freq_hz = first_hz;
+            self.vfo_mhz_input = format!("{:.5}", (first_hz as f64) / 1_000_000.0);
+        }
+        let _ = self
+            .cmd_tx
+            .send(WorkerCommand::UpdateConfig(self.config.clone()));
+        if let Some(sdr) = &self.sdrconnect_stream {
+            sdr.send_command(SdrConnectControlCmd::SetMonitoredFrequencies(enabled));
+        }
+        let _ = self.config.save(&self.config_path);
+    }
+
     fn inject_test_pocsag(&self) {
         let raw_burst = synthesize_pocsag_burst(
             self.config.sample_rate,
@@ -265,7 +313,9 @@ impl PdwApp {
             "PDW-RS 48KHZ POCSAG-1200 TEST MESSAGE OK",
             0.02,
         );
-        let burst = if self.config.input_source == InputSource::SdrConnectIq {
+        let (target_freq, burst) = if self.config.input_source == InputSource::SdrConnectIq {
+            let enabled = self.config.enabled_frequencies_hz();
+            let f_hz = enabled.first().copied().unwrap_or(DEFAULT_PRIMARY_FREQ_HZ);
             let iq_frame = synthesize_sdrconnect_iq_frame_from_baseband(
                 &raw_burst,
                 self.config.sample_rate,
@@ -280,11 +330,16 @@ impl PdwApp {
                 self.config.sdrconnect_afc_enabled,
                 self.config.sdrconnect_channel_bw_hz,
             );
-            test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst)
+            (
+                Some(f_hz),
+                test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst),
+            )
         } else {
-            raw_burst
+            (None, raw_burst)
         };
-        let _ = self.cmd_tx.send(WorkerCommand::InjectSamples(burst));
+        let _ = self
+            .cmd_tx
+            .send(WorkerCommand::InjectChannelSamples(target_freq, burst));
     }
 
     fn inject_test_flex(&self) {
@@ -296,7 +351,13 @@ impl PdwApp {
             "FLEX PHASE-B 4-FSK UNLOCKED!",
             0.02,
         );
-        let burst = if self.config.input_source == InputSource::SdrConnectIq {
+        let (target_freq, burst) = if self.config.input_source == InputSource::SdrConnectIq {
+            let enabled = self.config.enabled_frequencies_hz();
+            let f_hz = enabled
+                .get(1)
+                .or_else(|| enabled.first())
+                .copied()
+                .unwrap_or(DEFAULT_PRIMARY_FREQ_HZ);
             let iq_frame = synthesize_sdrconnect_iq_frame_from_baseband(
                 &raw_burst,
                 self.config.sample_rate,
@@ -311,11 +372,16 @@ impl PdwApp {
                 self.config.sdrconnect_afc_enabled,
                 self.config.sdrconnect_channel_bw_hz,
             );
-            test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst)
+            (
+                Some(f_hz),
+                test_demod.process_binary_frame(&iq_frame).unwrap_or(raw_burst),
+            )
         } else {
-            raw_burst
+            (None, raw_burst)
         };
-        let _ = self.cmd_tx.send(WorkerCommand::InjectSamples(burst));
+        let _ = self
+            .cmd_tx
+            .send(WorkerCommand::InjectChannelSamples(target_freq, burst));
     }
 
     fn restart_audio(&mut self) {
@@ -353,6 +419,11 @@ impl PdwApp {
             }
             InputSource::SdrConnectIq => {
                 self.config.sample_rate = 48_000;
+                self.config.enforce_2mhz_span_limit();
+                let monitored_freqs = self.config.enabled_frequencies_hz();
+                if let Some(&first_hz) = monitored_freqs.first() {
+                    self.config.sdrconnect_vfo_freq_hz = first_hz;
+                }
                 let _ = self
                     .cmd_tx
                     .send(WorkerCommand::UpdateConfig(self.config.clone()));
@@ -368,12 +439,21 @@ impl PdwApp {
                     channel_bw_hz: self.config.sdrconnect_channel_bw_hz,
                     tune_on_connect: self.config.sdrconnect_tune_on_connect,
                     initial_vfo_freq_hz: self.config.sdrconnect_vfo_freq_hz,
+                    monitored_freqs_hz: monitored_freqs.clone(),
                     use_audio_stream: self.config.sdrconnect_use_audio_stream,
                 };
-                let stream = start_sdrconnect_iq_capture(params, self.sample_tx.clone());
+                let stream = start_sdrconnect_iq_capture(params, self.sdr_chunk_tx.clone());
+                let freqs_desc = monitored_freqs
+                    .iter()
+                    .map(|&hz| format!("{:.5} MHz", (hz as f64) / 1_000_000.0))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
                 self.audio_status = format!(
-                    "SDRconnect IQ: ws://{}:{}/ ({} Hz)",
-                    self.config.sdrconnect_host, self.config.sdrconnect_port, self.config.sample_rate
+                    "SDRconnect IQ ({} ch: {}) @ ws://{}:{}/",
+                    monitored_freqs.len(),
+                    freqs_desc,
+                    self.config.sdrconnect_host,
+                    self.config.sdrconnect_port
                 );
                 self.sdrconnect_stream = Some(stream);
             }
@@ -394,9 +474,71 @@ impl PdwApp {
                     self.selected_message = None;
                     self.web_state.clear_messages();
                 }
+                WebUiCommand::ToggleFrequency(idx) => {
+                    if let Some(f) = self.config.monitored_frequencies.get(idx).cloned() {
+                        if !f.enabled {
+                            match self.config.validate_frequency_within_2mhz(f.freq_hz, Some(idx)) {
+                                Ok(_) => {
+                                    self.config.monitored_frequencies[idx].enabled = true;
+                                    self.freq_validation_error.clear();
+                                    self.sync_sdrconnect_frequencies();
+                                }
+                                Err(err) => {
+                                    self.freq_validation_error = err;
+                                }
+                            }
+                        } else if self
+                            .config
+                            .monitored_frequencies
+                            .iter()
+                            .filter(|x| x.enabled)
+                            .count()
+                            > 1
+                        {
+                            self.config.monitored_frequencies[idx].enabled = false;
+                            self.freq_validation_error.clear();
+                            self.sync_sdrconnect_frequencies();
+                        }
+                    }
+                }
+                WebUiCommand::AddFrequency { freq_hz, label } => {
+                    match self.config.validate_frequency_within_2mhz(freq_hz, None) {
+                        Ok(_) => {
+                            let lbl = if label.trim().is_empty() {
+                                format!("Channel {} ({:.5} MHz)", self.config.monitored_frequencies.len() + 1, (freq_hz as f64) / 1e6)
+                            } else {
+                                label.trim().to_string()
+                            };
+                            self.config.monitored_frequencies.push(MonitoredFrequency {
+                                enabled: true,
+                                freq_hz,
+                                label: lbl,
+                            });
+                            self.freq_validation_error.clear();
+                            self.sync_sdrconnect_frequencies();
+                        }
+                        Err(err) => {
+                            self.freq_validation_error = err;
+                        }
+                    }
+                }
+                WebUiCommand::RemoveFrequency(idx) => {
+                    if self.config.monitored_frequencies.len() > 1
+                        && idx < self.config.monitored_frequencies.len()
+                    {
+                        self.config.monitored_frequencies.remove(idx);
+                        if !self.config.monitored_frequencies.iter().any(|f| f.enabled) {
+                            if let Some(first) = self.config.monitored_frequencies.first_mut() {
+                                first.enabled = true;
+                            }
+                        }
+                        self.sync_sdrconnect_frequencies();
+                    }
+                }
             }
         }
 
+        let mut catalog_updated = false;
         while let Ok(mut msg) = self.msg_rx.try_recv() {
             if self.paused {
                 continue;
@@ -428,28 +570,50 @@ impl PdwApp {
                 FilterVerdict::Unmatched => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, false, None);
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.record_message(&msg);
+                        catalog_updated = true;
+                    }
                     self.web_state.record_message(&msg, true, false);
                     self.push_monitor(msg);
                 }
                 FilterVerdict::MatchedMonitorOnly(idx) => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, false, Some(idx));
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.record_message(&msg);
+                        catalog_updated = true;
+                    }
                     self.web_state.record_message(&msg, true, false);
                     self.push_monitor(msg);
                 }
                 FilterVerdict::MatchedFilterOnly(idx) => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, true, Some(idx));
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.record_message(&msg);
+                        catalog_updated = true;
+                    }
                     self.web_state.record_message(&msg, false, true);
                     self.push_filtered(msg);
                 }
                 FilterVerdict::MatchedBoth(idx) => {
                     self.stats.record(&msg);
                     self.config.log_message(&msg, true, Some(idx));
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.record_message(&msg);
+                        catalog_updated = true;
+                    }
                     self.web_state.record_message(&msg, true, true);
                     self.push_filtered(msg.clone());
                     self.push_monitor(msg);
                 }
+            }
+        }
+
+        if catalog_updated {
+            if let Ok(mut db) = self.catalog_db.lock() {
+                db.flush_if_dirty();
             }
         }
     }
@@ -476,10 +640,6 @@ impl eframe::App for PdwApp {
         }
         self.poll_decoded_messages();
 
-        // Low-CPU event-driven repaint schedule:
-        // - New messages wake the UI immediately via `egui_ctx.request_repaint()` from the DSP worker.
-        // - When `show_scope` is off (default), background telemetry refreshes at 1 FPS (1000 ms) instead of 20 FPS!
-        // - When `show_scope` is on, the oscilloscope refreshes at a smooth 8 FPS (125 ms).
         let repaint_ms = if self.config.show_scope { 125 } else { 1000 };
         ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
 
@@ -489,7 +649,14 @@ impl eframe::App for PdwApp {
             .map(|t| t.clone())
             .unwrap_or_default();
 
-        // Publish current telemetry & statistics snapshot to the live web server state
+        let catalog_count = self
+            .catalog_db
+            .lock()
+            .map(|db| db.total_capcodes())
+            .unwrap_or(0);
+        let (active_span_hz, _) = self.config.active_span_and_midpoint_hz();
+
+        // Publish current telemetry, parallel frequency list, and catalog count to the live web server
         {
             let (sdr_conn, vfo_hz, iq_rssi, afc_hz) = self
                 .sdrconnect_stream
@@ -520,6 +687,9 @@ impl eframe::App for PdwApp {
                 iq_rssi_dbfs: iq_rssi,
                 afc_offset_hz: afc_hz,
                 paused: self.paused,
+                monitored_frequencies: self.config.monitored_frequencies.clone(),
+                active_span_hz,
+                catalog_capcode_count: catalog_count,
             };
             self.web_state.update_telemetry(web_telem, &self.stats);
         }
@@ -528,8 +698,11 @@ impl eframe::App for PdwApp {
         egui::TopBottomPanel::top("top_toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let setup_btn_label = match self.config.input_source {
-                    InputSource::Soundcard => "Input Setup (Soundcard)",
-                    InputSource::SdrConnectIq => "Input Setup (SDRconnect IQ)",
+                    InputSource::Soundcard => "Input Setup (Soundcard)".to_string(),
+                    InputSource::SdrConnectIq => format!(
+                        "Input Setup (SDRconnect • {} Freqs)",
+                        self.config.enabled_frequencies_hz().len()
+                    ),
                 };
                 if ui.button(setup_btn_label).clicked() {
                     self.available_devices = list_input_devices();
@@ -543,6 +716,16 @@ impl eframe::App for PdwApp {
                     .clicked()
                 {
                     self.show_filters = true;
+                }
+                if ui
+                    .button(
+                        RichText::new(format!("Capcode Catalog ({})", catalog_count))
+                            .color(Color32::from_rgb(150, 235, 255)),
+                    )
+                    .on_hover_text("Open Capcode Directory & Message Catalog Database")
+                    .clicked()
+                {
+                    self.show_capcode_catalog = true;
                 }
                 if ui.button("Statistics").clicked() {
                     self.show_stats = true;
@@ -563,10 +746,10 @@ impl eframe::App for PdwApp {
                 ui.label("Search:");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("Capcode / text...")
+                        .hint_text("Capcode / text / freq...")
                         .desired_width(135.0),
                 )
-                .on_hover_text("Filter displayed rows by capcode, message text, mode, or label (click any capcode in the table to isolate it)");
+                .on_hover_text("Filter displayed rows by capcode, message text, frequency, groupcall, or label");
                 if !self.search_query.is_empty()
                     && ui
                         .small_button("×")
@@ -587,7 +770,7 @@ impl eframe::App for PdwApp {
 
             ui.separator();
 
-            // Second toolbar row: Input status, Active Mode, RX-Q, Web Server Toggle/Port, and optional Scope
+            // Second toolbar row: Input status, Parallel Frequencies, Active Mode, RX-Q, Web Server Toggle/Port, and optional Scope
             ui.horizontal_wrapped(|ui| {
                 if let Some(sdr) = &self.sdrconnect_stream {
                     if let Ok(st) = sdr.status.try_lock() {
@@ -596,10 +779,12 @@ impl eframe::App for PdwApp {
                         } else {
                             Color32::from_rgb(255, 185, 70)
                         };
-                        let vfo_str = st
-                            .vfo_freq_hz
-                            .map(|hz| format!(" | VFO: {:.4} MHz", (hz as f64) / 1_000_000.0))
-                            .unwrap_or_default();
+                        let freqs_str = st
+                            .active_frequencies_hz
+                            .iter()
+                            .map(|&hz| format!("{:.5} MHz", (hz as f64) / 1_000_000.0))
+                            .collect::<Vec<_>>()
+                            .join(" + ");
                         let rssi_str = if st.connected {
                             let state_tag = if !st.squelch_open {
                                 "SQL MUTED"
@@ -609,14 +794,21 @@ impl eframe::App for PdwApp {
                                 "NOISE"
                             };
                             format!(
-                                " | IQ: {:.1} dBFS ({}) | AFC: {:+.0} Hz",
-                                st.iq_rssi_dbfs, state_tag, st.afc_offset_hz
+                                " | {} | IQ: {:.1} dBFS ({}) | AFC: {:+.0} Hz",
+                                if st.parallel_mode_desc.is_empty() {
+                                    "Parallel".to_string()
+                                } else {
+                                    st.parallel_mode_desc.clone()
+                                },
+                                st.iq_rssi_dbfs,
+                                state_tag,
+                                st.afc_offset_hz
                             )
                         } else {
                             String::new()
                         };
                         ui.label(
-                            RichText::new(format!("{}{}{}", st.status_text, vfo_str, rssi_str))
+                            RichText::new(format!("{} [{}]{}", st.status_text, freqs_str, rssi_str))
                                 .small()
                                 .color(col),
                         );
@@ -781,21 +973,57 @@ impl eframe::App for PdwApp {
             });
         });
 
-        // Optional Bottom Panel: Full-Message Word-Wrapped Inspector when a row is clicked
+        // Bottom Panel: Full-Message Word-Wrapped Inspector + Capcode Directory Profile
         if let Some(sel) = self.selected_message.clone() {
             egui::TopBottomPanel::bottom("selected_msg_inspector")
                 .resizable(true)
-                .default_height(78.0)
-                .min_height(56.0)
-                .max_height(200.0)
+                .default_height(102.0)
+                .min_height(72.0)
+                .max_height(220.0)
                 .show(ctx, |ui| {
+                    let cap_profile_opt = self
+                        .catalog_db
+                        .lock()
+                        .ok()
+                        .and_then(|db| db.profiles.get(&sel.capcode).cloned());
+
                     ui.horizontal_wrapped(|ui| {
                         ui.strong(format!("Selected: {}", sel.capcode));
+                        if let Some(ref p) = cap_profile_opt {
+                            if !p.alias.is_empty() {
+                                ui.colored_label(
+                                    Color32::from_rgb(120, 255, 150),
+                                    format!("({})", p.alias),
+                                );
+                            }
+                        }
                         ui.separator();
+                        let freq_str = if sel.freq_hz.is_some() {
+                            format!("{} MHz | ", sel.freq_mhz_str())
+                        } else {
+                            String::new()
+                        };
+                        let grp_str = sel
+                            .group_address
+                            .as_ref()
+                            .map(|g| format!(" | Group: {}", g))
+                            .unwrap_or_default();
+                        let frag_str = sel
+                            .fragment_info
+                            .as_ref()
+                            .map(|f| format!(" | {}", f))
+                            .unwrap_or_default();
                         ui.label(
                             RichText::new(format!(
-                                "{} {} | {} | {} | {} bps",
-                                sel.date, sel.time, sel.mode, sel.msg_type, sel.bitrate
+                                "{}{} {} | {} | {} | {} bps{}{}",
+                                freq_str,
+                                sel.date,
+                                sel.time,
+                                sel.mode,
+                                sel.msg_type,
+                                sel.bitrate,
+                                grp_str,
+                                frag_str
                             ))
                             .small()
                             .color(Color32::from_rgb(150, 205, 255)),
@@ -805,6 +1033,19 @@ impl eframe::App for PdwApp {
                             ui.colored_label(LABEL_PALETTE[c_idx], format!("[{}]", lbl));
                         }
                         ui.separator();
+                        if ui
+                            .small_button(
+                                RichText::new("Open in Capcode Catalog")
+                                    .color(Color32::from_rgb(150, 235, 255)),
+                            )
+                            .clicked()
+                        {
+                            self.selected_catalog_capcode = Some(sel.capcode.clone());
+                            if let Some(ref p) = cap_profile_opt {
+                                self.editing_catalog_alias = p.alias.clone();
+                            }
+                            self.show_capcode_catalog = true;
+                        }
                         if ui.small_button("Copy Message").clicked() {
                             ui.ctx().copy_text(sel.message.clone());
                         }
@@ -827,10 +1068,45 @@ impl eframe::App for PdwApp {
                         if ui.small_button("+ Add to Filters").clicked() {
                             self.prefill_filter_from_message(&sel);
                         }
+                        if cap_profile_opt.is_some()
+                            && ui
+                                .small_button(
+                                    RichText::new("Remove from DB")
+                                        .color(Color32::from_rgb(255, 130, 130)),
+                                )
+                                .on_hover_text("Remove this capcode and its message history from the Capcode Catalog DB")
+                                .clicked()
+                        {
+                            if let Ok(mut db) = self.catalog_db.lock() {
+                                db.remove_capcode(&sel.capcode);
+                            }
+                            self.web_state.notify_catalog_updated();
+                        }
                         if ui.small_button("Close ×").clicked() {
                             self.selected_message = None;
                         }
                     });
+
+                    // Capcode Directory Summary Line
+                    if let Some(p) = cap_profile_opt {
+                        ui.label(
+                            RichText::new(format!(
+                                "Capcode Directory Profile — First Seen: {} {} | Last Seen: {} {} | Total Msgs: {} | Baud Rates: {} bps | Modes: {} | Freqs: {} | FLEX Groupcalls: {}",
+                                p.first_seen_date,
+                                p.first_seen_time,
+                                p.last_seen_date,
+                                p.last_seen_time,
+                                p.message_count,
+                                p.bitrates_display(),
+                                p.modes_display(),
+                                p.frequencies_display(),
+                                p.groups_display()
+                            ))
+                            .small()
+                            .color(Color32::from_rgb(165, 243, 252)),
+                        );
+                    }
+
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("inspector_scroll")
@@ -878,7 +1154,7 @@ impl eframe::App for PdwApp {
                     ));
                 }
                 ui.label(
-                    RichText::new("(Click column headers to sort • Click capcode to isolate • Click message to inspect)")
+                    RichText::new("(Click column headers to sort • Click capcode to view profile & isolate • Click message to inspect)")
                         .small()
                         .color(Color32::from_rgb(145, 160, 180)),
                 );
@@ -938,6 +1214,9 @@ impl eframe::App for PdwApp {
             }
         });
 
+        if let Some(m) = table_events.selected_msg {
+            self.selected_message = Some(m);
+        }
         if let Some(cap) = table_events.clicked_capcode {
             if self.search_query.eq_ignore_ascii_case(&cap) {
                 self.search_query.clear();
@@ -945,11 +1224,19 @@ impl eframe::App for PdwApp {
                 self.search_query = cap;
             }
         }
-        if let Some(m) = table_events.selected_msg {
-            self.selected_message = Some(m);
-        }
         if let Some(m) = table_events.add_filter_for_msg {
             self.prefill_filter_from_message(&m);
+        }
+        if let Some(cap) = table_events.open_catalog_for_capcode {
+            if let Ok(db) = self.catalog_db.lock() {
+                if let Some(p) = db.profiles.get(&cap) {
+                    self.editing_catalog_alias = p.alias.clone();
+                } else {
+                    self.editing_catalog_alias.clear();
+                }
+            }
+            self.selected_catalog_capcode = Some(cap);
+            self.show_capcode_catalog = true;
         }
 
         // Dialogs
@@ -957,6 +1244,7 @@ impl eframe::App for PdwApp {
         self.render_options_dialog(ctx);
         self.render_filters_dialog(ctx);
         self.render_stats_dialog(ctx);
+        self.render_capcode_catalog_dialog(ctx);
     }
 }
 
@@ -978,6 +1266,11 @@ fn compute_sorted_filtered_indices(
                     || m.message.to_ascii_lowercase().contains(&q)
                     || m.mode.to_ascii_lowercase().contains(&q)
                     || m.msg_type.to_ascii_lowercase().contains(&q)
+                    || m.freq_mhz_str().to_ascii_lowercase().contains(&q)
+                    || m.group_address
+                        .as_ref()
+                        .map(|g| g.to_ascii_lowercase().contains(&q))
+                        .unwrap_or(false)
                     || m.filter_label
                         .as_ref()
                         .map(|l| l.to_ascii_lowercase().contains(&q))
@@ -998,6 +1291,16 @@ fn compute_sorted_filtered_indices(
                 let cmp = messages[a]
                     .capcode
                     .cmp(&messages[b].capcode)
+                    .then_with(|| a.cmp(&b));
+                if sort_asc { cmp } else { cmp.reverse() }
+            });
+        }
+        SortColumn::Frequency => {
+            indices.sort_by(|&a, &b| {
+                let cmp = messages[a]
+                    .freq_hz
+                    .unwrap_or(0)
+                    .cmp(&messages[b].freq_hz.unwrap_or(0))
                     .then_with(|| a.cmp(&b));
                 if sort_asc { cmp } else { cmp.reverse() }
             });
@@ -1060,18 +1363,20 @@ fn render_message_table(
         .resizable(true)
         .stick_to_bottom(stick_bottom)
         .max_scroll_height(height)
-        .column(Column::initial(92.0).at_least(75.0)) // Address
-        .column(Column::initial(72.0).at_least(60.0)) // Time
-        .column(Column::initial(70.0).at_least(60.0)) // Date
-        .column(Column::initial(76.0).at_least(65.0)) // Mode
-        .column(Column::initial(66.0).at_least(55.0)) // Type
-        .column(Column::initial(60.0).at_least(48.0)) // Bitrate
-        .column(Column::remainder().at_least(200.0))  // Message & Filter Label
+        .column(Column::initial(88.0).at_least(72.0)) // Address
+        .column(Column::initial(68.0).at_least(58.0)) // Time
+        .column(Column::initial(66.0).at_least(56.0)) // Date
+        .column(Column::initial(82.0).at_least(68.0)) // Freq (MHz)
+        .column(Column::initial(74.0).at_least(62.0)) // Mode
+        .column(Column::initial(62.0).at_least(52.0)) // Type
+        .column(Column::initial(56.0).at_least(46.0)) // Bitrate
+        .column(Column::remainder().at_least(200.0))  // Message & Badges
         .header(21.0, |mut header| {
-            let columns: [(&str, SortColumn); 7] = [
+            let columns: [(&str, SortColumn); 8] = [
                 ("Address", SortColumn::Address),
                 ("Time", SortColumn::Arrival),
                 ("Date", SortColumn::Arrival),
+                ("Freq (MHz)", SortColumn::Frequency),
                 ("Mode", SortColumn::Mode),
                 ("Type", SortColumn::MsgType),
                 ("Bitrate", SortColumn::Bitrate),
@@ -1124,12 +1429,17 @@ fn render_message_table(
                                     .sense(egui::Sense::click()),
                                 )
                                 .on_hover_text(
-                                    "Click to isolate this capcode (click again to show all) • Right-click for options",
+                                    "Click to view Capcode Directory profile & isolate this capcode • Right-click for Capcode Catalog",
                                 );
                             if cap_resp.clicked() {
+                                events.selected_msg = Some(m.clone());
                                 events.clicked_capcode = Some(m.capcode.clone());
                             }
                             cap_resp.context_menu(|ui| {
+                                if ui.button("Open in Capcode Catalog...").clicked() {
+                                    events.open_catalog_for_capcode = Some(m.capcode.clone());
+                                    ui.close_menu();
+                                }
                                 if ui.button("Filter View by This Capcode").clicked() {
                                     events.clicked_capcode = Some(m.capcode.clone());
                                     ui.close_menu();
@@ -1149,6 +1459,13 @@ fn render_message_table(
                         });
                         row.col(|ui| {
                             ui.colored_label(Color32::from_rgb(110, 190, 255), &m.date);
+                        });
+                        row.col(|ui| {
+                            let f_txt = match m.freq_hz {
+                                Some(hz) if hz > 0 => format!("{:.5}", (hz as f64) / 1_000_000.0),
+                                _ => "Audio".to_string(),
+                            };
+                            ui.colored_label(Color32::from_rgb(165, 243, 252), f_txt);
                         });
                         row.col(|ui| {
                             ui.colored_label(Color32::from_rgb(255, 110, 110), &m.mode);
@@ -1180,14 +1497,18 @@ fn render_message_table(
                                         .sense(egui::Sense::click()),
                                     )
                                     .on_hover_text(
-                                        "Click to open in bottom Message Inspector • Right-click to copy or filter",
+                                        "Click to open in bottom Message & Capcode Profile Inspector • Right-click for options",
                                     );
                                 if resp.clicked() {
                                     events.selected_msg = Some(m.clone());
                                 }
                                 resp.context_menu(|ui| {
-                                    if ui.button("Inspect Full Message").clicked() {
+                                    if ui.button("Inspect Message & Capcode Profile").clicked() {
                                         events.selected_msg = Some(m.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Open Capcode in Capcode Catalog...").clicked() {
+                                        events.open_catalog_for_capcode = Some(m.capcode.clone());
                                         ui.close_menu();
                                     }
                                     if ui.button("Copy Message Text").clicked() {
@@ -1200,10 +1521,11 @@ fn render_message_table(
                                     }
                                     if ui.button("Copy Full Row").clicked() {
                                         ui.ctx().copy_text(format!(
-                                            "{} {} {} {} {} {} {}",
+                                            "{} {} {} {} {} {} {} {}",
                                             m.capcode,
                                             m.time,
                                             m.date,
+                                            m.freq_mhz_str(),
                                             m.mode,
                                             m.msg_type,
                                             m.bitrate,
@@ -1227,6 +1549,18 @@ fn render_message_table(
                                     ui.colored_label(
                                         LABEL_PALETTE[col_idx],
                                         format!("[{}]", label),
+                                    );
+                                }
+                                if let Some(grp) = &m.group_address {
+                                    ui.colored_label(
+                                        Color32::from_rgb(250, 204, 21),
+                                        format!("[GRP:{}]", grp),
+                                    );
+                                }
+                                if let Some(frag) = &m.fragment_info {
+                                    ui.colored_label(
+                                        Color32::from_rgb(192, 132, 252),
+                                        format!("[{}]", frag),
                                     );
                                 }
                                 if m.soft_recovered_words > 0 {
@@ -1273,10 +1607,10 @@ impl PdwApp {
             return;
         }
         let mut open = self.show_audio_setup;
-        egui::Window::new("Signal Input Setup (Soundcard / SDRconnect IQ)")
+        egui::Window::new("Signal Input Setup (Soundcard / Parallel SDRconnect IQ)")
             .open(&mut open)
-            .resizable(false)
-            .default_width(450.0)
+            .resizable(true)
+            .default_width(540.0)
             .show(ctx, |ui| {
                 ui.heading("Signal Input Source");
                 ui.horizontal(|ui| {
@@ -1294,7 +1628,7 @@ impl PdwApp {
                         .radio_value(
                             &mut self.config.input_source,
                             InputSource::SdrConnectIq,
-                            "SDRconnect (Direct WebSocket IQ)",
+                            "SDRconnect (Direct WebSocket IQ — Parallel Multi-Frequency)",
                         )
                         .clicked()
                     {
@@ -1349,20 +1683,11 @@ impl PdwApp {
                             });
                     }
                     InputSource::SdrConnectIq => {
-                        ui.label(
-                            RichText::new(
-                                "Pulls raw 16-bit IQ samples directly from SDRconnect WebSocket API (iq_stream_enable / binary type 2) with a Butterworth complex filter & DC-coupled polar FM discriminator.",
-                            )
-                            .small()
-                            .color(Color32::from_rgb(170, 215, 255)),
-                        );
-                        ui.add_space(4.0);
-
                         ui.horizontal(|ui| {
                             ui.label("SDRconnect Host:");
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.config.sdrconnect_host)
-                                    .desired_width(140.0),
+                                    .desired_width(135.0),
                             );
                             ui.label("Port:");
                             let mut port_u32 = self.config.sdrconnect_port as u32;
@@ -1376,31 +1701,202 @@ impl PdwApp {
                             {
                                 self.config.sdrconnect_port = port_u32 as u16;
                             }
-                        });
-
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
                             ui.checkbox(
                                 &mut self.config.sdrconnect_tune_on_connect,
-                                "Set VFO on Connect (MHz):",
+                                "Sync LO/VFO on Connect",
                             );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.vfo_mhz_input)
-                                    .desired_width(95.0),
+                        });
+
+                        ui.separator();
+                        let (span_hz, mid_hz) = self.config.active_span_and_midpoint_hz();
+                        let enabled_cnt = self.config.enabled_frequencies_hz().len();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong("Parallel Monitored Frequencies (<= 2.000 MHz Receiver Bandwidth)");
+                            ui.colored_label(
+                                Color32::from_rgb(165, 243, 252),
+                                format!(
+                                    "Span: {:.2} kHz / 2000.00 kHz ({} active • Midpoint: {:.5} MHz)",
+                                    (span_hz as f64) / 1000.0,
+                                    enabled_cnt,
+                                    (mid_hz as f64) / 1_000_000.0
+                                ),
                             );
-                            if ui.button("Tune VFO Now").clicked() {
-                                if let Ok(mhz) = self.vfo_mhz_input.trim().parse::<f64>() {
-                                    let hz = (mhz * 1_000_000.0).round() as u64;
-                                    self.config.sdrconnect_vfo_freq_hz = hz;
-                                    if let Some(sdr) = &self.sdrconnect_stream {
-                                        sdr.send_command(SdrConnectControlCmd::SetVfoFrequency(hz));
-                                    }
-                                    let _ = self.config.save(&self.config_path);
+                        });
+
+                        let mut toggle_idx: Option<(usize, bool)> = None;
+                        let mut remove_freq_idx: Option<usize> = None;
+                        let mut tune_now_hz: Option<u64> = None;
+                        let mut label_changed = false;
+                        let total_freqs = self.config.monitored_frequencies.len();
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("parallel_freq_list_scroll")
+                            .max_height(145.0)
+                            .show(ui, |ui| {
+                                for (idx, item) in
+                                    self.config.monitored_frequencies.iter_mut().enumerate()
+                                {
+                                    ui.horizontal(|ui| {
+                                        let mut en = item.enabled;
+                                        if ui.checkbox(&mut en, "").changed() {
+                                            toggle_idx = Some((idx, en));
+                                        }
+                                        ui.colored_label(
+                                            if item.enabled {
+                                                Color32::from_rgb(253, 224, 71)
+                                            } else {
+                                                Color32::GRAY
+                                            },
+                                            format!("{:.5} MHz", (item.freq_hz as f64) / 1_000_000.0),
+                                        );
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut item.label)
+                                                    .hint_text("Channel label...")
+                                                    .desired_width(175.0),
+                                            )
+                                            .changed()
+                                        {
+                                            label_changed = true;
+                                        }
+                                        if ui
+                                            .small_button("Tune VFO")
+                                            .on_hover_text("Tune SDRconnect primary VFO to this frequency")
+                                            .clicked()
+                                        {
+                                            tune_now_hz = Some(item.freq_hz);
+                                        }
+                                        if total_freqs > 1
+                                            && ui
+                                                .small_button("Remove")
+                                                .on_hover_text("Remove frequency from list")
+                                                .clicked()
+                                        {
+                                            remove_freq_idx = Some(idx);
+                                        }
+                                    });
                                 }
+                            });
+
+                        if let Some((idx, want_enabled)) = toggle_idx {
+                            if want_enabled {
+                                let cand_hz = self.config.monitored_frequencies[idx].freq_hz;
+                                match self
+                                    .config
+                                    .validate_frequency_within_2mhz(cand_hz, Some(idx))
+                                {
+                                    Ok(_) => {
+                                        self.config.monitored_frequencies[idx].enabled = true;
+                                        self.freq_validation_error.clear();
+                                        self.sync_sdrconnect_frequencies();
+                                    }
+                                    Err(err) => {
+                                        self.freq_validation_error = err;
+                                    }
+                                }
+                            } else if enabled_cnt > 1 {
+                                self.config.monitored_frequencies[idx].enabled = false;
+                                self.freq_validation_error.clear();
+                                self.sync_sdrconnect_frequencies();
+                            } else {
+                                self.freq_validation_error =
+                                    "At least one frequency must remain enabled.".to_string();
+                            }
+                        }
+
+                        if let Some(idx) = remove_freq_idx {
+                            self.config.monitored_frequencies.remove(idx);
+                            if !self.config.monitored_frequencies.iter().any(|f| f.enabled) {
+                                if let Some(first) = self.config.monitored_frequencies.first_mut() {
+                                    first.enabled = true;
+                                }
+                            }
+                            self.freq_validation_error.clear();
+                            self.sync_sdrconnect_frequencies();
+                        }
+
+                        if let Some(hz) = tune_now_hz {
+                            self.config.sdrconnect_vfo_freq_hz = hz;
+                            if let Some(sdr) = &self.sdrconnect_stream {
+                                sdr.send_command(SdrConnectControlCmd::SetVfoFrequency(hz));
+                            }
+                            let _ = self.config.save(&self.config_path);
+                        }
+
+                        if label_changed {
+                            let _ = self.config.save(&self.config_path);
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Add Freq (MHz):");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_freq_mhz_input)
+                                    .hint_text("e.g. 929.73862")
+                                    .desired_width(105.0),
+                            );
+                            ui.label("Label:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.new_freq_label_input)
+                                    .hint_text("Optional label")
+                                    .desired_width(130.0),
+                            );
+                            if ui.button("+ Add Parallel Freq").clicked() {
+                                if let Ok(mhz) = self.new_freq_mhz_input.trim().parse::<f64>() {
+                                    let cand_hz = (mhz * 1_000_000.0).round() as u64;
+                                    match self.config.validate_frequency_within_2mhz(cand_hz, None)
+                                    {
+                                        Ok(_) => {
+                                            let lbl = if self.new_freq_label_input.trim().is_empty()
+                                            {
+                                                format!(
+                                                    "Channel {} ({:.5} MHz)",
+                                                    self.config.monitored_frequencies.len() + 1,
+                                                    mhz
+                                                )
+                                            } else {
+                                                self.new_freq_label_input.trim().to_string()
+                                            };
+                                            self.config.monitored_frequencies.push(
+                                                MonitoredFrequency {
+                                                    enabled: true,
+                                                    freq_hz: cand_hz,
+                                                    label: lbl,
+                                                },
+                                            );
+                                            self.new_freq_mhz_input.clear();
+                                            self.new_freq_label_input.clear();
+                                            self.freq_validation_error.clear();
+                                            self.sync_sdrconnect_frequencies();
+                                        }
+                                        Err(err) => {
+                                            self.freq_validation_error = err;
+                                        }
+                                    }
+                                } else {
+                                    self.freq_validation_error =
+                                        "Enter a valid numeric frequency in MHz (e.g. 929.73862)."
+                                            .to_string();
+                                }
+                            }
+                            if ui
+                                .small_button("Reset Defaults (929.61250 & 929.73862)")
+                                .clicked()
+                            {
+                                self.config.monitored_frequencies =
+                                    default_monitored_frequencies(DEFAULT_PRIMARY_FREQ_HZ);
+                                self.freq_validation_error.clear();
+                                self.sync_sdrconnect_frequencies();
                             }
                         });
 
-                        ui.add_space(4.0);
+                        if !self.freq_validation_error.is_empty() {
+                            ui.colored_label(
+                                Color32::from_rgb(255, 100, 100),
+                                &self.freq_validation_error,
+                            );
+                        }
+
+                        ui.separator();
                         let mut demod_changed = false;
                         ui.horizontal(|ui| {
                             demod_changed |= ui
@@ -1427,7 +1923,6 @@ impl PdwApp {
                                 )
                                 .text("IQ Channel Low-Pass BW (Hz)"),
                             )
-                            .on_hover_text("Keep >= 16,000 Hz so ±4.8 kHz outer 4-FSK tones pass with zero attenuation")
                             .changed();
 
                         ui.horizontal(|ui| {
@@ -1461,7 +1956,6 @@ impl PdwApp {
                                 &mut self.config.sdrconnect_use_audio_stream,
                                 "Use SDRconnect Demodulated Audio Stream (Type 1) instead of Raw IQ (Type 2)",
                             )
-                            .on_hover_text("Unchecked (default): pulls raw Type-2 IQ samples and demodulates internally. Checked: pulls SDRconnect's Type-1 NFM audio stream.")
                             .changed();
 
                         if demod_changed {
@@ -1483,38 +1977,19 @@ impl PdwApp {
                                 ui.separator();
                                 ui.label(
                                     RichText::new(format!(
-                                        "Status: {} | Frames: {} | Measured Rate: {} sps",
+                                        "Status: {} | Mode: {} | Frames: {} | Rate: {} sps",
                                         st.status_text,
+                                        if st.parallel_mode_desc.is_empty() {
+                                            "Active"
+                                        } else {
+                                            &st.parallel_mode_desc
+                                        },
                                         st.iq_frames_received,
                                         if st.measured_iq_rate > 0 {
                                             st.measured_iq_rate
                                         } else {
                                             st.iq_sample_rate
                                         }
-                                    ))
-                                    .small(),
-                                );
-                                ui.label(
-                                    RichText::new(format!(
-                                        "VFO: {} | LO Center: {} | Demod: {} | VFO BW: {} | RSSI: {:.1} dBFS | SNR: {}",
-                                        st.vfo_freq_hz
-                                            .map(|h| format!("{:.4} MHz", (h as f64) / 1e6))
-                                            .unwrap_or_else(|| "N/A".to_string()),
-                                        st.center_freq_hz
-                                            .map(|h| format!("{:.4} MHz", (h as f64) / 1e6))
-                                            .unwrap_or_else(|| "N/A".to_string()),
-                                        if st.demodulator.is_empty() {
-                                            "N/A"
-                                        } else {
-                                            &st.demodulator
-                                        },
-                                        st.filter_bw_hz
-                                            .map(|b| format!("{} Hz", b))
-                                            .unwrap_or_else(|| "N/A".to_string()),
-                                        st.iq_rssi_dbfs,
-                                        st.signal_snr_db
-                                            .map(|s| format!("{:.1} dB", s))
-                                            .unwrap_or_else(|| "N/A".to_string()),
                                     ))
                                     .small(),
                                 );
@@ -1555,9 +2030,6 @@ impl PdwApp {
                         InputSource::SdrConnectIq => "Apply & Reconnect SDRconnect",
                     };
                     if ui.button(btn_text).clicked() {
-                        if let Ok(mhz) = self.vfo_mhz_input.trim().parse::<f64>() {
-                            self.config.sdrconnect_vfo_freq_hz = (mhz * 1_000_000.0).round() as u64;
-                        }
                         self.restart_audio();
                     }
                     if ui.button("Close").clicked() {
@@ -1566,6 +2038,391 @@ impl PdwApp {
                 });
             });
         self.show_audio_setup &= open;
+    }
+
+    fn render_capcode_catalog_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_capcode_catalog {
+            return;
+        }
+        let mut open = self.show_capcode_catalog;
+        egui::Window::new("Capcode Directory & Message Catalog Database (pdw_capcode_db.dat)")
+            .open(&mut open)
+            .default_width(860.0)
+            .default_height(560.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                let mut clear_all_clicked = false;
+                let mut delete_capcode: Option<String> = None;
+                let mut save_alias_for: Option<(String, String)> = None;
+                let mut select_capcode: Option<(String, String)> = None;
+                let mut isolate_in_monitor: Option<String> = None;
+
+                let (profiles_list, total_msgs_indexed) = if let Ok(db) = self.catalog_db.lock() {
+                    let q = self.catalog_search_query.trim().to_ascii_lowercase();
+                    let mut list: Vec<_> = db
+                        .profiles
+                        .values()
+                        .filter(|p| {
+                            if q.is_empty() {
+                                true
+                            } else {
+                                p.capcode.to_ascii_lowercase().contains(&q)
+                                    || p.alias.to_ascii_lowercase().contains(&q)
+                                    || p.modes_display().to_ascii_lowercase().contains(&q)
+                                    || p.groups_display().to_ascii_lowercase().contains(&q)
+                                    || p.frequencies_display().to_ascii_lowercase().contains(&q)
+                                    || p.messages
+                                        .iter()
+                                        .any(|m| m.message.to_ascii_lowercase().contains(&q))
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    list.sort_by(|a, b| {
+                        b.message_count
+                            .cmp(&a.message_count)
+                            .then_with(|| a.capcode.cmp(&b.capcode))
+                    });
+                    (list, db.total_indexed_messages())
+                } else {
+                    (Vec::new(), 0)
+                };
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(format!(
+                        "Cataloged Capcodes: {} | Indexed Messages: {}",
+                        profiles_list.len(),
+                        total_msgs_indexed
+                    ));
+                    ui.separator();
+                    ui.label("Search Catalog:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.catalog_search_query)
+                            .hint_text("Capcode, alias, groupcall 2029568, or message text...")
+                            .desired_width(240.0),
+                    );
+                    if !self.catalog_search_query.is_empty() && ui.small_button("×").clicked() {
+                        self.catalog_search_query.clear();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(
+                            RichText::new("Clear Entire Database")
+                                .color(Color32::from_rgb(255, 110, 110)),
+                        )
+                        .on_hover_text("Remove all capcodes and indexed messages from pdw_capcode_db.dat (flat Logfiles/ are preserved)")
+                        .clicked()
+                    {
+                        clear_all_clicked = true;
+                    }
+                });
+
+                ui.separator();
+
+                // Upper Master Table of Capcode Profiles
+                ui.push_id("catalog_master_table", |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .resizable(true)
+                        .max_scroll_height(210.0)
+                        .column(Column::initial(88.0).at_least(72.0)) // Capcode
+                        .column(Column::initial(110.0).at_least(80.0)) // Alias
+                        .column(Column::initial(54.0).at_least(44.0)) // Msgs
+                        .column(Column::initial(118.0).at_least(95.0)) // First Seen
+                        .column(Column::initial(118.0).at_least(95.0)) // Last Seen
+                        .column(Column::initial(82.0).at_least(65.0)) // Baud Rates
+                        .column(Column::initial(82.0).at_least(65.0)) // Modes
+                        .column(Column::initial(95.0).at_least(75.0)) // Freqs
+                        .column(Column::initial(115.0).at_least(85.0)) // FLEX Groupcalls
+                        .column(Column::remainder().at_least(70.0)) // Actions
+                        .header(20.0, |mut hdr| {
+                            for col_name in [
+                                "Capcode",
+                                "Alias / Label",
+                                "Msgs",
+                                "First Seen",
+                                "Last Seen",
+                                "Baud Rates",
+                                "Modes",
+                                "Freqs",
+                                "FLEX Groupcalls",
+                                "Action",
+                            ] {
+                                hdr.col(|ui| {
+                                    ui.strong(col_name);
+                                });
+                            }
+                        })
+                        .body(|body| {
+                            body.rows(20.0, profiles_list.len(), |mut row| {
+                                let p = &profiles_list[row.index()];
+                                let is_sel = self.selected_catalog_capcode.as_deref()
+                                    == Some(p.capcode.as_str());
+                                row.set_selected(is_sel);
+
+                                row.col(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            is_sel,
+                                            RichText::new(&p.capcode)
+                                                .strong()
+                                                .color(Color32::from_rgb(245, 245, 255)),
+                                        )
+                                        .clicked()
+                                    {
+                                        select_capcode =
+                                            Some((p.capcode.clone(), p.alias.clone()));
+                                    }
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(110, 255, 140),
+                                        &p.alias,
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.label(format!("{}", p.message_count));
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(110, 190, 255),
+                                        format!("{} {}", p.first_seen_date, p.first_seen_time),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(110, 190, 255),
+                                        format!("{} {}", p.last_seen_date, p.last_seen_time),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 120, 120),
+                                        p.bitrates_display(),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 180, 90),
+                                        p.modes_display(),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(165, 243, 252),
+                                        p.frequencies_display(),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.colored_label(
+                                        Color32::from_rgb(250, 204, 21),
+                                        p.groups_display(),
+                                    );
+                                });
+                                row.col(|ui| {
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("View").clicked() {
+                                            select_capcode =
+                                                Some((p.capcode.clone(), p.alias.clone()));
+                                        }
+                                        if ui
+                                            .small_button(
+                                                RichText::new("Delete")
+                                                    .color(Color32::from_rgb(255, 110, 110)),
+                                            )
+                                            .clicked()
+                                        {
+                                            delete_capcode = Some(p.capcode.clone());
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                });
+
+                ui.separator();
+
+                // Lower Detail Pane: Selected Capcode Profile & Associated Messages
+                let selected_profile = self
+                    .selected_catalog_capcode
+                    .as_ref()
+                    .and_then(|cap| {
+                        self.catalog_db
+                            .lock()
+                            .ok()
+                            .and_then(|db| db.profiles.get(cap).cloned())
+                    })
+                    .or_else(|| profiles_list.first().cloned());
+
+                if let Some(p) = selected_profile {
+                    if self.selected_catalog_capcode.as_deref() != Some(p.capcode.as_str()) {
+                        self.selected_catalog_capcode = Some(p.capcode.clone());
+                        self.editing_catalog_alias = p.alias.clone();
+                    }
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading(format!("Capcode {} Messages ({})", p.capcode, p.messages.len()));
+                        ui.separator();
+                        ui.label("Alias / Notes:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.editing_catalog_alias)
+                                .desired_width(150.0),
+                        );
+                        if ui.small_button("Save Alias").clicked() {
+                            save_alias_for =
+                                Some((p.capcode.clone(), self.editing_catalog_alias.clone()));
+                        }
+                        if ui.small_button("Isolate in Main Monitor").clicked() {
+                            isolate_in_monitor = Some(p.capcode.clone());
+                        }
+                        if ui
+                            .small_button(
+                                RichText::new("Remove Capcode from DB")
+                                    .color(Color32::from_rgb(255, 110, 110)),
+                            )
+                            .clicked()
+                        {
+                            delete_capcode = Some(p.capcode.clone());
+                        }
+                    });
+
+                    ui.label(
+                        RichText::new(format!(
+                            "First Appearance: {} {} | Last Appearance: {} {} | Total Count: {} | Baud Rates: {} bps | Modes: {} | Freqs: {} | Assigned FLEX Groupcalls: {}",
+                            p.first_seen_date,
+                            p.first_seen_time,
+                            p.last_seen_date,
+                            p.last_seen_time,
+                            p.message_count,
+                            p.bitrates_display(),
+                            p.modes_display(),
+                            p.frequencies_display(),
+                            p.groups_display()
+                        ))
+                        .small()
+                        .color(Color32::from_rgb(165, 243, 252)),
+                    );
+
+                    let msgs_rev: Vec<_> = p.messages.iter().rev().cloned().collect();
+                    let detail_h = ui.available_height().max(110.0);
+                    ui.push_id("catalog_detail_msgs", |ui| {
+                        TableBuilder::new(ui)
+                            .striped(true)
+                            .resizable(true)
+                            .max_scroll_height(detail_h)
+                            .column(Column::initial(70.0).at_least(58.0)) // Time
+                            .column(Column::initial(68.0).at_least(58.0)) // Date
+                            .column(Column::initial(84.0).at_least(68.0)) // Freq
+                            .column(Column::initial(74.0).at_least(62.0)) // Mode
+                            .column(Column::initial(62.0).at_least(52.0)) // Type
+                            .column(Column::initial(56.0).at_least(46.0)) // Bitrate
+                            .column(Column::initial(105.0).at_least(75.0)) // Group / Frags
+                            .column(Column::remainder().at_least(200.0)) // Message
+                            .header(19.0, |mut hdr| {
+                                for h_title in [
+                                    "Time",
+                                    "Date",
+                                    "Freq (MHz)",
+                                    "Mode",
+                                    "Type",
+                                    "Bitrate",
+                                    "Group / Frags",
+                                    "Message",
+                                ] {
+                                    hdr.col(|ui| {
+                                        ui.strong(h_title);
+                                    });
+                                }
+                            })
+                            .body(|body| {
+                                body.rows(19.0, msgs_rev.len(), |mut row| {
+                                    let m = &msgs_rev[row.index()];
+                                    row.col(|ui| {
+                                        ui.colored_label(Color32::from_rgb(110, 190, 255), &m.time);
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(Color32::from_rgb(110, 190, 255), &m.date);
+                                    });
+                                    row.col(|ui| {
+                                        let f_str = if m.freq_hz.is_some() {
+                                            m.freq_mhz_str()
+                                        } else {
+                                            "Audio".to_string()
+                                        };
+                                        ui.colored_label(Color32::from_rgb(165, 243, 252), f_str);
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(Color32::from_rgb(255, 110, 110), &m.mode);
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(
+                                            Color32::from_rgb(255, 180, 90),
+                                            &m.msg_type,
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(
+                                            Color32::from_rgb(255, 110, 110),
+                                            format!("{}", m.bitrate),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        let mut tags = Vec::new();
+                                        if let Some(g) = &m.group_address {
+                                            tags.push(format!("GRP:{}", g));
+                                        }
+                                        if let Some(f) = &m.fragment_info {
+                                            tags.push(f.clone());
+                                        }
+                                        ui.colored_label(
+                                            Color32::from_rgb(250, 204, 21),
+                                            tags.join(" "),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.colored_label(
+                                            Color32::from_rgb(120, 255, 255),
+                                            &m.message,
+                                        );
+                                    });
+                                });
+                            });
+                    });
+                } else {
+                    ui.label("No capcodes recorded in the database yet.");
+                }
+
+                if let Some((cap, alias)) = select_capcode {
+                    self.selected_catalog_capcode = Some(cap);
+                    self.editing_catalog_alias = alias;
+                }
+                if let Some((cap, alias)) = save_alias_for {
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.set_alias(&cap, &alias);
+                    }
+                    self.web_state.notify_catalog_updated();
+                }
+                if let Some(cap) = delete_capcode {
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.remove_capcode(&cap);
+                    }
+                    if self.selected_catalog_capcode.as_deref() == Some(cap.as_str()) {
+                        self.selected_catalog_capcode = None;
+                    }
+                    self.web_state.notify_catalog_updated();
+                }
+                if clear_all_clicked {
+                    if let Ok(mut db) = self.catalog_db.lock() {
+                        db.clear_all();
+                    }
+                    self.selected_catalog_capcode = None;
+                    self.web_state.notify_catalog_updated();
+                }
+                if let Some(cap) = isolate_in_monitor {
+                    self.search_query = cap;
+                }
+            });
+        self.show_capcode_catalog &= open;
     }
 
     fn render_options_dialog(&mut self, ctx: &egui::Context) {
@@ -2020,88 +2877,149 @@ impl PdwApp {
     }
 }
 
-/// Dedicated background DSP & Decoder worker thread.
+/// Isolated per-frequency DSP & protocol decoder slice so multiple frequencies
+/// within the 2.0 MHz SDR bandwidth decode simultaneously without state interference.
+struct ChannelDecoderPipeline {
+    freq_hz: Option<u64>,
+    env: AdaptiveEnvelopeTracker,
+    qual: RxQualityTracker,
+    pocsag_atb: AtbSlicer,
+    flex_atb: AtbSlicer,
+    pocsag_main: PocsagChannelDecoder,
+    flex: FlexDecoder,
+    sample_counter: usize,
+}
+
+impl ChannelDecoderPipeline {
+    fn new(freq_hz: Option<u64>, cfg: &AppConfig) -> Self {
+        let mut env = AdaptiveEnvelopeTracker::new();
+        env.manual_center_offset = cfg.manual_center_offset;
+        Self {
+            freq_hz,
+            env,
+            qual: RxQualityTracker::new(),
+            pocsag_atb: AtbSlicer::new(cfg.sample_rate, cfg.audio_preset, cfg.invert_polarity),
+            flex_atb: AtbSlicer::new(cfg.sample_rate, cfg.audio_preset, cfg.invert_polarity),
+            pocsag_main: PocsagChannelDecoder::new(cfg.sample_rate, 1200),
+            flex: FlexDecoder::new(cfg.sample_rate),
+            sample_counter: 0,
+        }
+    }
+
+    fn apply_config(&mut self, new_cfg: &AppConfig, old_cfg: &AppConfig) {
+        if new_cfg.sample_rate != old_cfg.sample_rate {
+            self.pocsag_atb.set_sample_rate(new_cfg.sample_rate);
+            self.flex_atb.set_sample_rate(new_cfg.sample_rate);
+            self.pocsag_main.set_sample_rate(new_cfg.sample_rate);
+            self.flex.set_sample_rate(new_cfg.sample_rate);
+        }
+        self.pocsag_atb.set_preset(new_cfg.audio_preset);
+        self.flex_atb.set_preset(new_cfg.audio_preset);
+        if new_cfg.invert_polarity != old_cfg.invert_polarity {
+            self.pocsag_atb.set_invert(new_cfg.invert_polarity);
+            self.flex_atb.set_invert(new_cfg.invert_polarity);
+        }
+        self.env.manual_center_offset = new_cfg.manual_center_offset;
+    }
+}
+
+/// Dedicated background DSP & Decoder worker thread supporting parallel frequency channels.
 fn run_dsp_worker(
     mut cfg: AppConfig,
     sample_rx: Receiver<Vec<f32>>,
+    sdr_chunk_rx: Receiver<DemodAudioChunk>,
     cmd_rx: Receiver<WorkerCommand>,
     msg_tx: Sender<DecodedPagerMessage>,
     telemetry: Arc<Mutex<DspTelemetry>>,
     egui_ctx: Option<egui::Context>,
 ) {
     let bch = BchDecoder::new();
-    let mut env = AdaptiveEnvelopeTracker::new();
-    let mut qual = RxQualityTracker::new();
-
-    let mut pocsag_atb = AtbSlicer::new(cfg.sample_rate, cfg.audio_preset, cfg.invert_polarity);
-    let mut flex_atb = AtbSlicer::new(cfg.sample_rate, cfg.audio_preset, cfg.invert_polarity);
-    let mut pocsag_main = PocsagChannelDecoder::new(cfg.sample_rate, 1200);
-    let mut flex = FlexDecoder::new(cfg.sample_rate);
-
+    let mut pipelines: Vec<ChannelDecoderPipeline> = vec![ChannelDecoderPipeline::new(None, &cfg)];
     let mut scope_ring: VecDeque<f32> = VecDeque::from(vec![0.0; 80]);
-    let mut sample_counter: usize = 0;
+    let (raw_msg_tx, raw_msg_rx) = bounded::<DecodedPagerMessage>(256);
+
+    let mut run_on_pipeline = |freq_hz: Option<u64>,
+                               samples: &[f32],
+                               cfg: &AppConfig,
+                               pipelines: &mut Vec<ChannelDecoderPipeline>,
+                               scope_ring: &mut VecDeque<f32>| {
+        let pos = pipelines
+            .iter()
+            .position(|p| p.freq_hz == freq_hz)
+            .unwrap_or_else(|| {
+                pipelines.push(ChannelDecoderPipeline::new(freq_hz, cfg));
+                pipelines.len() - 1
+            });
+        let pipe = &mut pipelines[pos];
+        process_audio_chunk(
+            samples,
+            cfg,
+            &bch,
+            &mut pipe.env,
+            &mut pipe.qual,
+            &mut pipe.pocsag_atb,
+            &mut pipe.flex_atb,
+            &mut pipe.pocsag_main,
+            &mut pipe.flex,
+            &raw_msg_tx,
+            scope_ring,
+            &mut pipe.sample_counter,
+            &telemetry,
+            egui_ctx.as_ref(),
+        );
+        while let Ok(mut m) = raw_msg_rx.try_recv() {
+            if m.freq_hz.is_none() {
+                m.freq_hz = freq_hz;
+            }
+            let _ = msg_tx.try_send(m);
+        }
+    };
 
     loop {
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 WorkerCommand::UpdateConfig(new_cfg) => {
-                    if new_cfg.sample_rate != cfg.sample_rate {
-                        pocsag_atb.set_sample_rate(new_cfg.sample_rate);
-                        flex_atb.set_sample_rate(new_cfg.sample_rate);
-                        pocsag_main.set_sample_rate(new_cfg.sample_rate);
-                        flex.set_sample_rate(new_cfg.sample_rate);
+                    for p in &mut pipelines {
+                        p.apply_config(&new_cfg, &cfg);
                     }
-                    pocsag_atb.set_preset(new_cfg.audio_preset);
-                    flex_atb.set_preset(new_cfg.audio_preset);
-                    if new_cfg.invert_polarity != cfg.invert_polarity {
-                        pocsag_atb.set_invert(new_cfg.invert_polarity);
-                        flex_atb.set_invert(new_cfg.invert_polarity);
-                    }
-                    env.manual_center_offset = new_cfg.manual_center_offset;
                     cfg = new_cfg;
                 }
                 WorkerCommand::ResetRxQuality => {
-                    qual.reset();
+                    for p in &mut pipelines {
+                        p.qual.reset();
+                    }
                 }
                 WorkerCommand::InjectSamples(samples) => {
-                    process_audio_chunk(
-                        &samples,
-                        &cfg,
-                        &bch,
-                        &mut env,
-                        &mut qual,
-                        &mut pocsag_atb,
-                        &mut flex_atb,
-                        &mut pocsag_main,
-                        &mut flex,
-                        &msg_tx,
-                        &mut scope_ring,
-                        &mut sample_counter,
-                        &telemetry,
-                        egui_ctx.as_ref(),
-                    );
+                    run_on_pipeline(None, &samples, &cfg, &mut pipelines, &mut scope_ring);
+                }
+                WorkerCommand::InjectChannelSamples(freq_hz, samples) => {
+                    run_on_pipeline(freq_hz, &samples, &cfg, &mut pipelines, &mut scope_ring);
                 }
             }
         }
 
-        match sample_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+        let mut processed_any = false;
+        while let Ok(sdr_chunk) = sdr_chunk_rx.try_recv() {
+            processed_any = true;
+            run_on_pipeline(
+                sdr_chunk.freq_hz,
+                &sdr_chunk.samples,
+                &cfg,
+                &mut pipelines,
+                &mut scope_ring,
+            );
+        }
+
+        if processed_any {
+            if let Ok(chunk) = sample_rx.try_recv() {
+                run_on_pipeline(None, &chunk, &cfg, &mut pipelines, &mut scope_ring);
+            }
+            continue;
+        }
+
+        match sample_rx.recv_timeout(std::time::Duration::from_millis(20)) {
             Ok(chunk) => {
-                process_audio_chunk(
-                    &chunk,
-                    &cfg,
-                    &bch,
-                    &mut env,
-                    &mut qual,
-                    &mut pocsag_atb,
-                    &mut flex_atb,
-                    &mut pocsag_main,
-                    &mut flex,
-                    &msg_tx,
-                    &mut scope_ring,
-                    &mut sample_counter,
-                    &telemetry,
-                    egui_ctx.as_ref(),
-                );
+                run_on_pipeline(None, &chunk, &cfg, &mut pipelines, &mut scope_ring);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -2151,8 +3069,6 @@ pub fn process_audio_chunk(
             scope_ring.push_back(s - cfg.manual_center_offset);
         }
 
-        // Convert float sample to PDW's scale without hard-clipping at ±127.0 when IQ gain > 1.0,
-        // preserving the linear 3:1 outer-to-inner 4-FSK symbol amplitude ratio in `FlexDecoder::slice_symbol`.
         let val = ((s - cfg.manual_center_offset) * 128.0).clamp(-512.0, 512.0);
 
         // =========================================================================
@@ -2244,7 +3160,6 @@ pub fn process_audio_chunk(
                 }
             }
 
-            // Only run the POCSAG bit-clock division and sampling when `pocbit > 0`
             if !started_pocsag_preamble && pocsag_atb.pocbit > 0 {
                 pocsag_atb.atb_len += 1;
                 let p_center = pocsag_atb.atb_center[pocsag_atb.config_index];
@@ -2333,8 +3248,6 @@ pub fn process_audio_chunk(
                             + (flex_atb.watch_step * 0.5)
                             + flex_atb.atb_sample_offset[flex_atb.config_index];
                         if flex.flex_blk > 0 && flex.levels == 4 {
-                            // Damped PLL during 4-FSK data blocks so skewed inner-to-outer
-                            // zero-crossings (+1.6 kHz <-> -4.8 kHz) never yank the sample strobe
                             let err = target_ctr - flex_atb.watch_ctr;
                             if err.abs() < flex_atb.watch_step * 0.35 {
                                 flex_atb.watch_ctr += err * 0.25;
@@ -2441,7 +3354,6 @@ pub fn process_audio_chunk(
         emitted_any = true;
     }
 
-    // Throttle telemetry mutex updates to ~10 Hz (every 4096 samples) or when a message arrives
     let should_update_telem = emitted_any || ((*sample_counter / 4096) != (prev_counter / 4096));
     if should_update_telem {
         if let Ok(mut t) = telemetry.try_lock() {
@@ -2465,7 +3377,6 @@ pub fn process_audio_chunk(
         }
     }
 
-    // Wake GUI immediately when a new message is decoded
     if emitted_any {
         if let Some(ctx) = egui_ctx {
             ctx.request_repaint();

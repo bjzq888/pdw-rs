@@ -280,34 +280,37 @@ pub fn synthesize_pocsag_burst(
 
 /// Build an 88-word FLEX phase frame with 1 Alphanumeric message (`Flex.cpp:435–496`).
 pub fn build_flex_alpha_phase_words(capcode: u32, msg: &str) -> [u32; 88] {
+    build_flex_alpha_phase_words_frag(capcode, msg, 3, false)
+}
+
+/// Build an 88-word FLEX phase frame with explicit `fragment_num` (`0..=3`) and `continued` flag (bit 10).
+pub fn build_flex_alpha_phase_words_frag(
+    capcode: u32,
+    msg: &str,
+    fragment_num: u8,
+    continued: bool,
+) -> [u32; 88] {
     let mut words = [0x1f_ffffu32; 88];
-    // BIW at word 0: asa = 1 (end block = 0), vsa = 2
     let mut biw: u32 = (2 << 10) | (0 << 8);
     biw = add_flex_xsum(biw);
     words[0] = biw;
 
-    // Short address at word 1: `capcode + 32768`
     words[1] = (capcode + 32_768) & 0x1f_ffff;
 
-    // In `Flex.cpp:449–496`:
-    // - `words[3]` (`w1` initial) is the message header word (`iFragmentNumber = 3` in bits 11..12); `w1++` advances `w1` to `4`.
-    // - `words[4]` (`k == w1`) has signature/flags in bits 0..6 (skipped when `iFragmentNumber == 3`),
-    //   and the first 2 characters (`bytes[0]` and `bytes[1]`) in bits 7..13 and 14..20!
-    // - `words[5..]` (`k > w1`) pack 3 characters per 21-bit word!
     let bytes = msg.as_bytes();
     let rem_len = bytes.len().saturating_sub(2);
     let extra_char_words = (rem_len + 2) / 3;
-    let total_words = 2 + extra_char_words; // words[3] (header) + words[4] (first 2 chars) + words[5..]
+    let total_words = 2 + extra_char_words;
 
-    // Vector word at word 2: vt = 5 (ALPHA), w1 = 3, len = total_words
     let mut vec_w: u32 = (5 << 4) | (3 << 7) | ((total_words as u32) << 14);
     vec_w = add_flex_xsum(vec_w);
     words[2] = vec_w;
 
-    // Word 3: Header word with `iFragmentNumber = 3` (bits 11..=12)
-    words[3] = 3 << 11;
+    // Word 3: Header word with `fragment_num` in bits 11..=12 and `continued` in bit 10
+    let cont_bit = if continued { 1u32 << 10 } else { 0 };
+    words[3] = (((fragment_num & 0x03) as u32) << 11) | cont_bit;
 
-    // Word 4: Signature in bits 0..6 + first 2 characters in bits 7..13 and 14..20
+    // Word 4: Signature (0x7F) in bits 0..6 + first 2 characters in bits 7..13 and 14..20
     let first_c1 = bytes.first().copied().unwrap_or(0x03) as u32;
     let first_c2 = bytes.get(1).copied().unwrap_or(0x03) as u32;
     words[4] = 0x7f | ((first_c1 & 0x7f) << 7) | ((first_c2 & 0x7f) << 14);
@@ -337,7 +340,6 @@ pub fn synthesize_flex_4fsk_burst(
     let bch = BchDecoder::new();
     let mut symbols_1600: Vec<u8> = Vec::new();
 
-    // 1. 64 symbols of alternating 2-level 1600-baud preamble (0, 3, 0, 3...)
     for i in 0..64 {
         symbols_1600.push(if i % 2 == 0 { 0 } else { 3 });
     }
@@ -349,17 +351,14 @@ pub fn synthesize_flex_4fsk_burst(
         }
     };
 
-    // 2. Sync-1 for FLEX-3200 4-FSK (1600 sps, 4-level, Phases A + B): A1 = 0xB068
     let a1: u16 = 0xB068;
     push_word_2fsk(&mut symbols_1600, a1);
     push_word_2fsk(&mut symbols_1600, 0xA6C6);
     push_word_2fsk(&mut symbols_1600, 0xAAAA);
     push_word_2fsk(&mut symbols_1600, !a1);
 
-    // 16-bit frame marker before FIW (`flex_bc` 87..=72)
     push_word_2fsk(&mut symbols_1600, 0xAAAA);
 
-    // 32-bit Frame Info Word (FIW) at `flex_bc` 71..=40 (Cycle = 3, Frame = 42)
     let mut fiw_data = [0u8; 21];
     let cy_inv = (3u8 ^ 0x0f) & 0x0f;
     for ihd in 4..8 {
@@ -374,7 +373,6 @@ pub fn synthesize_flex_4fsk_burst(
         symbols_1600.push(if b == 1 { 0 } else { 3 });
     }
 
-    // 40-symbol Sync-2 sequence at 1600 sps (`flex_bc` 39..=0)
     for i in 0..40 {
         symbols_1600.push(if i % 2 == 0 { 0 } else { 3 });
     }
@@ -441,8 +439,8 @@ pub fn synthesize_flex_4fsk_burst(
     samples
 }
 
-/// Synthesize a 3200-sps FLEX-6400 (4-FSK, Phases A+B+C+D) or FLEX-3200 (2-FSK, Phases A+C) burst
-/// to verify 1600 -> 3200 baud `cross_over` synchronization at 44.1 kHz and 48 kHz.
+/// Synthesize a 3200-sps FLEX-6400 (4-FSK, Phases A+B+C+D) burst.
+#[allow(clippy::too_many_arguments)]
 pub fn synthesize_flex_6400_4fsk_burst(
     sample_rate: u32,
     cap_a: u32,
@@ -456,7 +454,6 @@ pub fn synthesize_flex_6400_4fsk_burst(
     noise_level: f32,
 ) -> Vec<f32> {
     let bch = BchDecoder::new();
-    // Express the entire frame in 3200-sps half-bit units (where each 1600-bps header bit = 2 units)
     let mut symbols_3200: Vec<u8> = Vec::new();
 
     let push_1600_bit = |v: &mut Vec<u8>, gin: u8| {
@@ -472,19 +469,16 @@ pub fn synthesize_flex_6400_4fsk_burst(
         }
     };
 
-    // 1. 64 bits of 1600-bps preamble
     for i in 0..64 {
         push_1600_bit(&mut symbols_3200, if i % 2 == 0 { 0 } else { 3 });
     }
 
-    // 2. Sync-1 for FLEX-6400 (3200 sps, 4-FSK, Phases A+B+C+D): A1 = 0xDEA0
     let a1: u16 = 0xDEA0;
     push_word_1600(&mut symbols_3200, a1);
     push_word_1600(&mut symbols_3200, 0xA6C6);
     push_word_1600(&mut symbols_3200, 0xAAAA);
     push_word_1600(&mut symbols_3200, !a1);
 
-    // 3. 16-bit marker + 32-bit FIW at 1600 bps (48 bits = 96 3200-sps units)
     push_word_1600(&mut symbols_3200, 0xAAAA);
     let mut fiw_data = [0u8; 21];
     let cy_inv = (6u8 ^ 0x0f) & 0x0f;
@@ -500,12 +494,10 @@ pub fn synthesize_flex_6400_4fsk_burst(
         push_1600_bit(&mut symbols_3200, if b == 1 { 0 } else { 3 });
     }
 
-    // 4. Sync-2: 40 1600-baud bit-periods = 80 symbols at 3200 sps (ending with 3200-baud alternating 0, 3, 0, 3...)
     for i in 0..80 {
         symbols_3200.push(if i % 2 == 0 { 0 } else { 3 });
     }
 
-    // 5. 11 data blocks at 3200 sps (interleaving Phase A/B on hbit=0 and Phase C/D on hbit=1)
     let words_a = build_flex_alpha_phase_words(cap_a, txt_a);
     let words_b = build_flex_alpha_phase_words(cap_b, txt_b);
     let words_c = build_flex_alpha_phase_words(cap_c, txt_c);

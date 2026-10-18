@@ -1,5 +1,5 @@
-//! Configuration, Filter Matching Engine, Duplicate Blocker, Statistics,
-//! and Legacy `PDW.ini` / `FILTERS.INI` Importer/Exporter.
+//! Configuration, Parallel Multi-Frequency List (`<= 2.0 MHz` Span), Filter Matching Engine,
+//! Duplicate Blocker, Statistics, and Legacy `PDW.ini` / `FILTERS.INI` Importer/Exporter.
 
 use crate::dsp::{AudioPreset, DEFAULT_SAMPLE_RATE};
 use crate::pocsag::DecodedPagerMessage;
@@ -8,6 +8,28 @@ use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+
+/// Maximum allowed frequency spread (2.0 MHz) across simultaneously enabled SDR frequencies.
+pub const MAX_PARALLEL_SPAN_HZ: u64 = 2_000_000;
+
+/// Default primary paging frequency: 929.61250 MHz (929,612.50 kHz).
+pub const DEFAULT_PRIMARY_FREQ_HZ: u64 = 929_612_500;
+
+/// Default secondary paging frequency: 929.73862 MHz (929,738.62 kHz).
+pub const DEFAULT_SECONDARY_FREQ_HZ: u64 = 929_738_620;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitoredFrequency {
+    pub enabled: bool,
+    pub freq_hz: u64,
+    pub label: String,
+}
+
+impl MonitoredFrequency {
+    pub fn mhz_str(&self) -> String {
+        format!("{:.5}", (self.freq_hz as f64) / 1_000_000.0)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputSource {
@@ -91,7 +113,7 @@ pub struct AppConfig {
     pub audio_device_name: Option<String>,
     pub sample_rate: u32,
 
-    // SDRconnect WebSocket IQ settings
+    // SDRconnect WebSocket IQ settings & Parallel Multi-Frequency List
     pub sdrconnect_host: String,
     pub sdrconnect_port: u16,
     pub sdrconnect_iq_gain: f32,
@@ -102,6 +124,8 @@ pub struct AppConfig {
     pub sdrconnect_tune_on_connect: bool,
     pub sdrconnect_vfo_freq_hz: u64,
     pub sdrconnect_use_audio_stream: bool,
+    pub monitored_frequencies: Vec<MonitoredFrequency>,
+
     pub audio_preset: AudioPreset,
     pub invert_polarity: bool,
     pub auto_dc_tracking: bool,
@@ -152,7 +176,7 @@ impl Default for AppConfig {
         Self {
             input_source: InputSource::Soundcard,
             audio_device_name: None,
-            sample_rate: DEFAULT_SAMPLE_RATE, // 48,000 Hz default (auto-adapts to 44,100 Hz on VB-Cable)
+            sample_rate: DEFAULT_SAMPLE_RATE,
             sdrconnect_host: crate::sdrconnect::DEFAULT_SDRCONNECT_HOST.to_string(),
             sdrconnect_port: crate::sdrconnect::DEFAULT_SDRCONNECT_PORT,
             sdrconnect_iq_gain: 1.0,
@@ -161,9 +185,10 @@ impl Default for AppConfig {
             sdrconnect_afc_enabled: true,
             sdrconnect_channel_bw_hz: 20_000.0,
             sdrconnect_tune_on_connect: false,
-            sdrconnect_vfo_freq_hz: 929_612_500,
+            sdrconnect_vfo_freq_hz: DEFAULT_PRIMARY_FREQ_HZ,
             sdrconnect_use_audio_stream: false,
-            audio_preset: AudioPreset::Earphone1, // Matches PDW.cpp:632 default (`Profile.audioConfig = 5`)
+            monitored_frequencies: default_monitored_frequencies(DEFAULT_PRIMARY_FREQ_HZ),
+            audio_preset: AudioPreset::Earphone1,
             invert_polarity: false,
             auto_dc_tracking: true,
             manual_center_offset: 0.0,
@@ -179,12 +204,12 @@ impl Default for AppConfig {
             convert_flex_si: true,
             show_tone_only: true,
             show_numeric: true,
-            show_binary: false, // Hide encrypted/SCADA FLEX BINARY hex dumps by default
-            hide_encrypted_alpha: true, // Hide Base64/encrypted non-human-readable ALPHA payloads by default
-            show_scope: false,  // Disable live oscilloscope by default to minimize CPU usage
+            show_binary: false,
+            hide_encrypted_alpha: true,
+            show_scope: false,
             show_filter_pane: true,
             filter_window_only: false,
-            block_duplicates: false, // Match PDW.cpp:502 default (`Profile.BlockDuplicate = 0`)
+            block_duplicates: false,
             block_duplicate_seconds: 120,
             monitor_logfile_enabled: false,
             filter_logfile_enabled: false,
@@ -196,6 +221,29 @@ impl Default for AppConfig {
             filters: Vec::new(),
         }
     }
+}
+
+pub fn default_monitored_frequencies(primary_hz: u64) -> Vec<MonitoredFrequency> {
+    let f1 = if primary_hz > 0 {
+        primary_hz
+    } else {
+        DEFAULT_PRIMARY_FREQ_HZ
+    };
+    let mut list = vec![MonitoredFrequency {
+        enabled: true,
+        freq_hz: f1,
+        label: format!("Channel 1 ({:.5} MHz)", (f1 as f64) / 1_000_000.0),
+    }];
+    if f1 != DEFAULT_SECONDARY_FREQ_HZ
+        && f1.abs_diff(DEFAULT_SECONDARY_FREQ_HZ) <= MAX_PARALLEL_SPAN_HZ
+    {
+        list.push(MonitoredFrequency {
+            enabled: true,
+            freq_hz: DEFAULT_SECONDARY_FREQ_HZ,
+            label: "Channel 2 (929.73862 MHz)".to_string(),
+        });
+    }
+    list
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,11 +259,9 @@ impl AppConfig {
     pub fn load_or_default(path: &Path) -> Self {
         if let Ok(contents) = fs::read_to_string(path) {
             if let Ok(mut cfg) = toml::from_str::<AppConfig>(&contents) {
-                // Ensure IQ channel BW is wide enough for ±4.8 kHz 2/4-FSK Carson bandwidth (>= 12.5 kHz)
                 if cfg.sdrconnect_channel_bw_hz < 12_500.0 {
                     cfg.sdrconnect_channel_bw_hz = 20_000.0;
                 }
-                // Reset excessive IQ gain (> 2.0) that could clip 4-FSK outer symbols
                 if cfg.sdrconnect_iq_gain > 2.0 || cfg.sdrconnect_iq_gain < 0.25 {
                     cfg.sdrconnect_iq_gain = 1.0;
                 }
@@ -225,11 +271,23 @@ impl AppConfig {
                 if cfg.web_server_bind_addr.trim().is_empty() {
                     cfg.web_server_bind_addr = crate::web::DEFAULT_WEB_BIND_ADDR.to_string();
                 }
+                if cfg.monitored_frequencies.is_empty() {
+                    cfg.monitored_frequencies =
+                        default_monitored_frequencies(cfg.sdrconnect_vfo_freq_hz);
+                } else if cfg.monitored_frequencies.len() == 1
+                    && cfg.monitored_frequencies[0].freq_hz == DEFAULT_PRIMARY_FREQ_HZ
+                {
+                    cfg.monitored_frequencies.push(MonitoredFrequency {
+                        enabled: true,
+                        freq_hz: DEFAULT_SECONDARY_FREQ_HZ,
+                        label: "Channel 2 (929.73862 MHz)".to_string(),
+                    });
+                }
+                cfg.enforce_2mhz_span_limit();
                 return cfg;
             }
         }
         let mut cfg = Self::default();
-        // Auto-import settings from legacy `PDW.ini` / `pdw.ini` if present
         for ini_name in ["PDW.ini", "pdw.ini", "PDW.INI"] {
             let p = Path::new(ini_name);
             if p.exists() {
@@ -238,6 +296,90 @@ impl AppConfig {
             }
         }
         cfg
+    }
+
+    /// Returns all currently enabled frequencies in Hz (always non-empty; falls back to `sdrconnect_vfo_freq_hz`).
+    pub fn enabled_frequencies_hz(&self) -> Vec<u64> {
+        let mut freqs: Vec<u64> = self
+            .monitored_frequencies
+            .iter()
+            .filter(|f| f.enabled && f.freq_hz > 0)
+            .map(|f| f.freq_hz)
+            .collect();
+        if freqs.is_empty() {
+            let fallback = if self.sdrconnect_vfo_freq_hz > 0 {
+                self.sdrconnect_vfo_freq_hz
+            } else {
+                DEFAULT_PRIMARY_FREQ_HZ
+            };
+            freqs.push(fallback);
+        }
+        freqs
+    }
+
+    /// Validates whether enabling or adding `candidate_hz` stays within the 2.0 MHz receiver bandwidth
+    /// relative to all other enabled frequencies. Returns `Ok(new_span_hz)` or an explanation `Err`.
+    pub fn validate_frequency_within_2mhz(
+        &self,
+        candidate_hz: u64,
+        ignore_idx: Option<usize>,
+    ) -> Result<u64, String> {
+        if candidate_hz < 100_000 {
+            return Err("Frequency must be >= 0.100 MHz".to_string());
+        }
+        let mut min_hz = candidate_hz;
+        let mut max_hz = candidate_hz;
+        for (i, item) in self.monitored_frequencies.iter().enumerate() {
+            if Some(i) == ignore_idx || !item.enabled || item.freq_hz == 0 {
+                continue;
+            }
+            if item.freq_hz < min_hz {
+                min_hz = item.freq_hz;
+            }
+            if item.freq_hz > max_hz {
+                max_hz = item.freq_hz;
+            }
+        }
+        let span = max_hz - min_hz;
+        if span > MAX_PARALLEL_SPAN_HZ {
+            Err(format!(
+                "{:.5} MHz is {:.3} MHz away from enabled channels (max parallel receiver bandwidth is 2.000 MHz).",
+                (candidate_hz as f64) / 1_000_000.0,
+                (span as f64) / 1_000_000.0
+            ))
+        } else {
+            Ok(span)
+        }
+    }
+
+    /// Current span in Hz across all enabled frequencies (`max_hz - min_hz`), and the midpoint LO frequency.
+    pub fn active_span_and_midpoint_hz(&self) -> (u64, u64) {
+        let enabled = self.enabled_frequencies_hz();
+        let min_hz = enabled.iter().copied().min().unwrap_or(DEFAULT_PRIMARY_FREQ_HZ);
+        let max_hz = enabled.iter().copied().max().unwrap_or(DEFAULT_PRIMARY_FREQ_HZ);
+        (max_hz - min_hz, (min_hz + max_hz) / 2)
+    }
+
+    /// Ensure any loaded configuration does not violate the 2.0 MHz parallel span limit.
+    pub fn enforce_2mhz_span_limit(&mut self) {
+        let mut min_hz: Option<u64> = None;
+        let mut max_hz: Option<u64> = None;
+        for item in &mut self.monitored_frequencies {
+            if !item.enabled || item.freq_hz == 0 {
+                continue;
+            }
+            let new_min = min_hz.map(|m| m.min(item.freq_hz)).unwrap_or(item.freq_hz);
+            let new_max = max_hz.map(|m| m.max(item.freq_hz)).unwrap_or(item.freq_hz);
+            if new_max - new_min > MAX_PARALLEL_SPAN_HZ {
+                item.enabled = false;
+            } else {
+                min_hz = Some(new_min);
+                max_hz = Some(new_max);
+            }
+        }
+        if let Some(first_en) = self.monitored_frequencies.iter().find(|f| f.enabled) {
+            self.sdrconnect_vfo_freq_hz = first_en.freq_hz;
+        }
     }
 
     pub fn import_legacy_pdw_ini(&mut self, path: &Path) {
@@ -713,8 +855,6 @@ pub fn is_human_readable_message(msg: &str, msg_type: &str) -> bool {
         return false;
     }
 
-    // 1. Reject messages dominated by non-text symbol noise (`~`, `|`, `^`, etc.),
-    // excluding `?` which represents weak-signal bit errors in partially recovered human messages.
     let char_count = s.chars().count();
     let weird_count = s
         .chars()
@@ -724,7 +864,6 @@ pub fn is_human_readable_message(msg: &str, msg_type: &str) -> bool {
         return false;
     }
 
-    // 2. Inspect whitespace-delimited tokens for Base64 / ASCII-armored ciphertext
     let mut bad_chars = 0usize;
     let mut total_non_space = 0usize;
     for tok in s.split_whitespace() {
@@ -748,7 +887,6 @@ fn is_encrypted_or_gibberish_token(tok: &str) -> bool {
         return false;
     }
 
-    // Preserve URLs, email addresses, and file paths
     let low = tok.to_ascii_lowercase();
     if low.contains('@')
         || low.contains("http:")
@@ -787,10 +925,6 @@ fn is_encrypted_or_gibberish_token(tok: &str) -> bool {
 
     let other_sym = t_len.saturating_sub(upper + lower + digits + b64_sym);
 
-    // Count non-natural character-class transitions inside the single token:
-    // - lower -> UPPER
-    // - letter <-> digit
-    // - any transition involving Base64 symbols ('+', '/', '=')
     let mut suspicious_trans = 0usize;
     for pair in bytes.windows(2) {
         let a = pair[0];
@@ -812,7 +946,6 @@ fn is_encrypted_or_gibberish_token(tok: &str) -> bool {
         }
     }
 
-    // Base64 ciphertext tokens have mixed case + digits/symbols and frequent erratic class switches
     if upper > 0 && lower > 0 && suspicious_trans >= 4 {
         return true;
     }
